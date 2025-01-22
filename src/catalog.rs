@@ -5,6 +5,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
+use log::debug;
 use crate::{preamble::LogPreamble, util::*};
 use nom::{
     bytes::complete::take,
@@ -208,7 +209,7 @@ impl CatalogChunk {
                 log::warn!("[macos-unifiedlogs] Could not find main UUID in catalog");
                 String::new()
             });
-        dbg!(&main_uuid);
+        debug!("{}", &main_uuid);
 
         let dsc_uuid = uuids
             .get(catalog_dsc_uuid_index as usize)
