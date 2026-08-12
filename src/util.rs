@@ -5,13 +5,14 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use base64::{engine::general_purpose, DecodeError, Engine};
+use base64::{DecodeError, Engine, engine::general_purpose};
 use chrono::{SecondsFormat, TimeZone, Utc};
 use log::{error, warn};
 use nom::{
+    Parser,
     bytes::complete::{take, take_while},
-    combinator::{fail, opt},
-    sequence::tuple,
+    combinator::opt,
+    error::ErrorKind,
 };
 use std::str::from_utf8;
 
@@ -57,49 +58,50 @@ pub(crate) fn extract_string_size(data: &[u8], message_size: u64) -> nom::IResul
         let path_string = String::from_utf8(path.to_vec());
         match path_string {
             Ok(results) => return Ok((input, results.trim_end_matches(char::from(0)).to_string())),
-            Err(err) => error!(
-                "[macos-unifiedlogs] Failed to get extract specific string size: {:?}",
-                err
-            ),
+            Err(err) => {
+                error!("[macos-unifiedlogs] Failed to get extract specific string size: {err:?}")
+            }
         }
     }
 
     // Get whole string message except end of string (0s)
+    let message_size = match u64_to_usize(message_size) {
+        Some(m) => m,
+        None => {
+            error!("[macos-unifiedlogs] u64 is bigger than system usize");
+            return Err(nom::Err::Error(nom::error::Error::new(
+                data,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
+    };
+
     let (input, path) = take(message_size)(data)?;
     let path_string = String::from_utf8(path.to_vec());
     match path_string {
         Ok(results) => return Ok((input, results.trim_end_matches(char::from(0)).to_string())),
-        Err(err) => error!(
-            "[macos-unifiedlogs] Failed to get specific string: {:?}",
-            err
-        ),
+        Err(err) => error!("[macos-unifiedlogs] Failed to get specific string: {err:?}"),
     }
     Ok((input, String::from("Could not find path string")))
 }
 
 const NULL_BYTE: u8 = 0;
 
-#[allow(dead_code)]
-/// Extract an UTF8 string from a byte array, stops at `NULL_BYTE` or END OF STRING
-/// Consumes the end byte
-pub(crate) fn cstring(input: &[u8]) -> nom::IResult<&[u8], String> {
-    let (input, (str_part, _)) =
-        tuple((take_while(|b: u8| b != NULL_BYTE), opt(take(1_usize))))(input)?;
-    match from_utf8(str_part) {
-        Ok(results) => Ok((input, results.to_string())),
-        Err(_) => fail(input),
-    }
-}
-
 /// Extract an UTF8 string from a byte array, stops at `NULL_BYTE` or END OF STRING
 /// Consumes the end byte
 /// Fails if the string is empty
 pub(crate) fn non_empty_cstring(input: &[u8]) -> nom::IResult<&[u8], String> {
-    let (input, (str_part, _)) =
-        tuple((take_while(|b: u8| b != NULL_BYTE), opt(take(1_usize))))(input)?;
+    if input.is_empty() {
+        return Ok((input, String::new()));
+    }
+    let mut tup = (take_while(|b: u8| b != NULL_BYTE), opt(take(1_usize)));
+    let (input, (str_part, _)) = tup.parse(input)?;
     match from_utf8(str_part) {
         Ok(s) if !s.is_empty() => Ok((input, s.to_string())),
-        _ => fail(input),
+        _ => Err(nom::Err::Error(nom::error::Error {
+            input,
+            code: ErrorKind::Fail,
+        })),
     }
 }
 
@@ -116,10 +118,7 @@ pub(crate) fn extract_string(data: &[u8]) -> nom::IResult<&[u8], String> {
                 match path_string {
                     Ok(results) => return Ok((input, results.to_string())),
                     Err(err) => {
-                        warn!(
-                            "[macos-unifiedlogs] Failed to extract full string: {:?}",
-                            err
-                        );
+                        warn!("[macos-unifiedlogs] Failed to extract full string: {err:?}");
                         return Ok((input, String::from("Could not extract string")));
                     }
                 }
@@ -138,15 +137,10 @@ pub(crate) fn extract_string(data: &[u8]) -> nom::IResult<&[u8], String> {
             return Ok((input, results.to_string()));
         }
         Err(err) => {
-            warn!("[macos-unifiedlogs] Failed to get string: {:?}", err);
+            warn!("[macos-unifiedlogs] Failed to get string: {err:?}");
         }
     }
     Ok((input, String::from("Could not extract string")))
-}
-
-/// Clean and format UUIDs to be pretty
-pub(crate) fn clean_uuid(uuid_format: &str) -> String {
-    uuid_format.replace([',', '[', ']', ' '], "")
 }
 
 /// Base64 encode data use the STANDARD engine (alphabet along with "+" and "/")
@@ -163,6 +157,10 @@ pub(crate) fn decode_standard(data: &str) -> Result<Vec<u8>, DecodeError> {
 pub(crate) fn unixepoch_to_iso(timestamp: &i64) -> String {
     let date_time_result = Utc.timestamp_nanos(*timestamp);
     date_time_result.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+pub(crate) fn u64_to_usize(n: u64) -> Option<usize> {
+    usize::try_from(n).ok()
 }
 
 #[cfg(test)]
@@ -227,31 +225,6 @@ mod tests {
     fn test_unixepoch_to_iso() {
         let result = unixepoch_to_iso(&1650767813342574583);
         assert_eq!(result, "2022-04-24T02:36:53.342574583Z");
-    }
-
-    #[test]
-    fn test_cstring() -> anyhow::Result<()> {
-        let input = &[55, 57, 54, 46, 49, 48, 48, 0];
-        let (output, s) = cstring(input)?;
-        assert!(output.is_empty());
-        assert_eq!(s, "796.100");
-
-        let input = &[55, 57, 54, 46, 49, 48, 48];
-        let (output, s) = cstring(input)?;
-        assert!(output.is_empty());
-        assert_eq!(s, "796.100");
-
-        let input = &[55, 57, 54, 46, 49, 48, 48, 0, 42, 42, 42];
-        let (output, s) = cstring(input)?;
-        assert_eq!(output, [42, 42, 42]);
-        assert_eq!(s, "796.100");
-
-        let input = &[0, 42, 42, 42];
-        let (output, s) = cstring(input)?;
-        assert_eq!(output, [42, 42, 42]);
-        assert_eq!(s, "");
-
-        Ok(())
     }
 
     #[test]

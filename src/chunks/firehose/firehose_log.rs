@@ -10,15 +10,18 @@ use crate::chunks::firehose::loss::FirehoseLoss;
 use crate::chunks::firehose::nonactivity::FirehoseNonActivity;
 use crate::chunks::firehose::signpost::FirehoseSignpost;
 use crate::chunks::firehose::trace::FirehoseTrace;
-use crate::util::{encode_standard, extract_string_size, padding_size_8, padding_size_four};
+use crate::util::{
+    encode_standard, extract_string_size, padding_size_8, padding_size_four, u64_to_usize,
+};
 use log::{debug, error, warn};
+use nom::Parser;
 use nom::bytes::complete::take_while;
 use nom::combinator::map;
 use nom::multi::many_m_n;
-use nom::number::complete::{be_u128, le_i16, le_i32, le_i64, le_i8};
+use nom::number::complete::{be_u128, le_i8, le_i16, le_i32, le_i64};
 use nom::{
     bytes::complete::take,
-    number::complete::{le_u16, le_u32, le_u64, le_u8},
+    number::complete::{le_u8, le_u16, le_u32, le_u64},
 };
 use serde::Serialize;
 use std::mem::size_of;
@@ -47,9 +50,9 @@ pub struct FirehosePreamble {
 #[derive(Debug, Clone, Default)]
 pub struct Firehose {
     /// 0x2 is Activity, 0x4 is non-activity, 0x6 is signpost, 0x3 trace
-    pub unknown_log_activity_type: u8,
+    pub log_activity_type: u8,
     /// Unkonwn but possibly log type (Info/Activity, Debug, Error, Fault, Signpost, System, Default)
-    pub unknown_log_type: u8,
+    pub log_type: u8,
     pub flags: u16,
     pub format_string_location: u32,
     pub thread_id: u64,
@@ -61,35 +64,66 @@ pub struct Firehose {
     pub firehose_loss: FirehoseLoss,
     pub firehose_signpost: FirehoseSignpost,
     pub firehose_trace: FirehoseTrace,
-    pub unknown_item: u8,
+    pub item: u8,
     pub number_items: u8,
+    pub message_flags: Vec<MessageFlags>,
     /// Log values extracted
     pub message: FirehoseItemData,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct FirehoseItemType {
+    /// Type of item: strings, numbers, objects, precision
     pub item_type: u8,
-    item_size: u8,
-    offset: u16,
-    message_string_size: u16,
+    pub item_type_size: u8,
+    pub offset: u16,
+    /// Size of message in bytes
+    pub item_size: u16,
+    /// The message entry.
     pub message_strings: String,
+    /// Item type as Enum
+    pub item: FirehoseItem,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+pub enum FirehoseItem {
+    String,
+    PrivateNumber,
+    Number,
+    PrivateString,
+    Precision,
+    Sensitive,
+    Object,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum MessageFlags {
+    SharedCache,
+    MainExe,
+    HasLargeOffset,
+    LargeSharedCache,
+    Absolute,
+    UuidRelative,
+    MainPlugin,
+    PcStyle,
+    HasUniquePid,
+    HasCurrentAid,
+    HasOtherAid,
+    HasRules,
+    HasName,
+    AltIndex,
+    Unknown,
+    HasPrivateData,
+    HasOversize,
+    HasSubsystem,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FirehoseItemData {
-    pub item_info: Vec<FirehoseItemInfo>,
+    pub item_info: Vec<FirehoseItemType>,
     pub backtrace_strings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct FirehoseItemInfo {
-    /// The message entry.
-    pub message_strings: String,
-    /// Type of item: strings, numbers, objects, precision
-    pub item_type: u8,
-    /// Size of message in bytes
-    pub item_size: u16,
 }
 
 impl FirehosePreamble {
@@ -150,10 +184,10 @@ impl FirehosePreamble {
             let (firehose_input, firehose_public_data) =
                 FirehosePreamble::parse_firehose(public_data)?;
             public_data = firehose_input;
-            if !Self::LOG_TYPES.contains(&firehose_public_data.unknown_log_activity_type)
+            if !Self::LOG_TYPES.contains(&firehose_public_data.log_activity_type)
                 || public_data.len() < 24
             {
-                if Self::REMNANT_DATA == firehose_public_data.unknown_log_activity_type {
+                if Self::REMNANT_DATA == firehose_public_data.log_activity_type {
                     break;
                 }
                 if private_data_virtual_offset != 0x1000 {
@@ -161,7 +195,7 @@ impl FirehosePreamble {
                     let private_data_offset = private_offst - private_data_virtual_offset;
                     // Calculate start of private data. If the remaining input is greater than private data offset.
                     // Remove any padding/junk data in front of the private data
-                    if input.len() > private_data_offset.into() && public_data.is_empty() {
+                    if input.len() > private_data_offset as usize && public_data.is_empty() {
                         let leftover_data = input.len() - private_data_offset as usize;
                         let (private_data, _) = take(leftover_data)(input)?;
                         input = private_data;
@@ -232,11 +266,11 @@ impl FirehosePreamble {
     }
 
     /// Collect all the Firehose items (log message entries) in the log entry (chunk)
-    pub fn collect_items<'a>(
-        data: &'a [u8],
-        firehose_number_items: &u8,
-        firehose_flags: &u16,
-    ) -> nom::IResult<&'a [u8], FirehoseItemData> {
+    pub fn collect_items(
+        data: &[u8],
+        firehose_number_items: u8,
+        firehose_flags: u16,
+    ) -> nom::IResult<&[u8], FirehoseItemData> {
         /*
            Firehose Items are message types related to the log entry (chunk). There appear to be four (4) types:
            strings, numbers, objects, precision
@@ -248,7 +282,7 @@ impl FirehosePreamble {
         let mut firehose_item_data = FirehoseItemData::default();
 
         // Firehose number item values
-        let number_item_type: Vec<u8> = vec![0x0, 0x2];
+        let number_item_type = [0x0, 0x2];
         // Dynamic precision item types?
         let precision_items = [0x10, 0x12];
         //  Likely realted to private string. Seen only "<private>" values
@@ -256,7 +290,7 @@ impl FirehosePreamble {
         let sensitive_items = [0x5, 0x45, 0x85];
         let object_items = [0x40, 0x42];
 
-        while &item_count < firehose_number_items {
+        while item_count < firehose_number_items {
             // Get non-number values first since the values are at the end of the of the log (chunk) entry data
             let (item_value_input, mut item) =
                 FirehosePreamble::get_firehose_items(firehose_input)?;
@@ -272,18 +306,21 @@ impl FirehosePreamble {
 
             // Firehose number item values immediately follow the item type
             if number_item_type.contains(&item.item_type) {
-                let (item_value_input, message_number) =
-                    FirehosePreamble::parse_item_number(firehose_input, u16::from(item.item_size))?;
+                let (item_value_input, message_number) = FirehosePreamble::parse_item_number(
+                    firehose_input,
+                    u16::from(item.item_type_size),
+                )?;
 
-                item.message_strings = format!("{}", message_number);
+                item.message_strings = format!("{message_number}");
                 firehose_input = item_value_input;
                 item_count += 1;
+                item.item = FirehoseItem::Number;
                 items_data.push(item);
                 continue;
             }
 
             // A message size of 0 and is an object type is "(null)"
-            if item.message_string_size == 0 && object_items.contains(&item.item_type) {
+            if item.item_size == 0 && object_items.contains(&item.item_type) {
                 item.message_strings = String::from("(null)");
             }
             items_data.push(item);
@@ -323,6 +360,7 @@ impl FirehosePreamble {
             if Self::PRIVATE_STRINGS.contains(&item.item_type)
                 || sensitive_items.contains(&item.item_type)
             {
+                item.item = FirehoseItem::PrivateString;
                 item.message_strings = String::from("<private>");
                 continue;
             }
@@ -336,7 +374,7 @@ impl FirehosePreamble {
                 continue;
             }
 
-            if item.message_string_size == 0 && !item.message_strings.is_empty() {
+            if item.item_size == 0 && !item.message_strings.is_empty() {
                 continue;
             }
 
@@ -344,32 +382,20 @@ impl FirehosePreamble {
                 break;
             }
             if Self::STRING_ITEM.contains(&item.item_type) {
-                let (item_value_input, message_string) = FirehosePreamble::parse_item_string(
-                    firehose_input,
-                    item.item_type,
-                    item.message_string_size,
-                )?;
+                let (item_value_input, message_string) =
+                    FirehosePreamble::parse_item_string(firehose_input, item)?;
                 firehose_input = item_value_input;
                 item.message_strings = message_string;
             } else {
                 error!(
                     "[macos-unifiedlogs] Unknown Firehose item: {}",
-                    &item.item_type
+                    item.item_type
                 );
-                debug!("[macos-unifiedlogs] Firehose item data: {:?}", data);
+                debug!("[macos-unifiedlogs] Firehose item data: {data:?}");
             }
         }
 
-        // We now have all of the firehose items and the data
-        // Go through and append to vec
-        for item in items_data {
-            let item_info = FirehoseItemInfo {
-                message_strings: item.message_strings,
-                item_type: item.item_type,
-                item_size: item.message_string_size,
-            };
-            firehose_item_data.item_info.push(item_info);
-        }
+        firehose_item_data.item_info = items_data;
         Ok((firehose_input, firehose_item_data))
     }
 
@@ -389,7 +415,7 @@ impl FirehosePreamble {
                 if firehose_info.item_type == private_strings[3]
                     || firehose_info.item_type == private_strings[4]
                 {
-                    if private_string_start.len() < firehose_info.item_size.into() {
+                    if private_string_start.len() < firehose_info.item_size as usize {
                         let (private_data, pointer_object) =
                             take(private_string_start.len())(private_string_start)?;
                         private_string_start = private_data;
@@ -404,19 +430,32 @@ impl FirehosePreamble {
                     firehose_info.message_strings = encode_standard(pointer_object);
                     continue;
                 }
+                let null_private = 0;
+                // Even null values are marked private
+                if firehose_info.item_size == null_private {
+                    firehose_info.message_strings = String::from("<private>");
+                } else {
+                    let (private_data, private_string) = extract_string_size(
+                        private_string_start,
+                        u64::from(firehose_info.item_size),
+                    )?;
 
-                let (private_data, private_string) =
-                    extract_string_size(private_string_start, u64::from(firehose_info.item_size))?;
-
-                private_string_start = private_data;
-                firehose_info.message_strings = private_string;
+                    private_string_start = private_data;
+                    firehose_info.message_strings = private_string;
+                }
             } else if firehose_info.item_type == private_number {
-                let (private_data, private_string) = FirehosePreamble::parse_item_number(
-                    private_string_start,
-                    firehose_info.item_size,
-                )?;
-                private_string_start = private_data;
-                firehose_info.message_strings = format!("{}", private_string);
+                let private_number = 0x8000;
+                // Numbers can also be private
+                if firehose_info.item_size == private_number {
+                    firehose_info.message_strings = String::from("<private>")
+                } else {
+                    let (private_data, private_string) = FirehosePreamble::parse_item_number(
+                        private_string_start,
+                        firehose_info.item_size,
+                    )?;
+                    private_string_start = private_data;
+                    firehose_info.message_strings = format!("{private_string}");
+                }
             }
         }
         Ok((private_string_start, ()))
@@ -426,8 +465,8 @@ impl FirehosePreamble {
     fn parse_firehose(data: &[u8]) -> nom::IResult<&[u8], Firehose> {
         let mut firehose_results = Firehose::default();
 
-        let (input, unknown_log_activity_type) = le_u8(data)?;
-        let (input, unknown_log_type) = le_u8(input)?;
+        let (input, log_activity_type) = le_u8(data)?;
+        let (input, log_type) = le_u8(input)?;
         let (input, flags) = le_u16(input)?;
         let (input, format_string_location) = le_u32(input)?;
 
@@ -437,8 +476,8 @@ impl FirehosePreamble {
         let (input, continous_delta_upper) = le_u16(input)?;
         let (input, data_size) = le_u16(input)?;
 
-        firehose_results.unknown_log_activity_type = unknown_log_activity_type;
-        firehose_results.unknown_log_type = unknown_log_type;
+        firehose_results.log_activity_type = log_activity_type;
+        firehose_results.log_type = log_type;
         firehose_results.flags = flags;
         firehose_results.format_string_location = format_string_location;
         firehose_results.thread_id = thread_id;
@@ -448,50 +487,50 @@ impl FirehosePreamble {
 
         let (mut input, mut firehose_input) = take(data_size)(input)?;
 
-        // Log activity type (unknown_log_activity_type)
-        let activity: u8 = 0x2;
-        let signpost: u8 = 0x6;
-        let nonactivity: u8 = 0x4;
-        let loss: u8 = 0x7;
-        let trace: u8 = 0x3;
+        // Log activity type (log_activity_type)
+        let activity = 0x2;
+        let signpost = 0x6;
+        let nonactivity = 0x4;
+        let loss = 0x7;
+        let trace = 0x3;
 
-        // Unknown types
-        let unknown_remnant_data = 0x0; // 0x0 appears to be remnant data or garbage data (log command does not parse it either)
+        // 0x0 appears to be remnant data or garbage data (log command does not parse it either)
+        let remnant_data = 0x0;
 
-        if unknown_log_activity_type == activity {
+        if log_activity_type == activity {
             let (activity_data, activity) =
-                FirehoseActivity::parse_activity(firehose_input, &flags, &unknown_log_type)?;
+                FirehoseActivity::parse_activity(firehose_input, flags, log_type)?;
             firehose_input = activity_data;
             firehose_results.firehose_activity = activity;
-        } else if unknown_log_activity_type == nonactivity {
+        } else if log_activity_type == nonactivity {
             let (non_activity_data, non_activity) =
-                FirehoseNonActivity::parse_non_activity(firehose_input, &flags)?;
+                FirehoseNonActivity::parse_non_activity(firehose_input, flags)?;
             firehose_input = non_activity_data;
             firehose_results.firehose_non_activity = non_activity;
-        } else if unknown_log_activity_type == signpost {
+        } else if log_activity_type == signpost {
             let (process_data, firehose_signpost) =
-                FirehoseSignpost::parse_signpost(firehose_input, &flags)?;
+                FirehoseSignpost::parse_signpost(firehose_input, flags)?;
             firehose_input = process_data;
             firehose_results.firehose_signpost = firehose_signpost;
-        } else if unknown_log_activity_type == loss {
+        } else if log_activity_type == loss {
             let (loss_data, firehose_loss) = FirehoseLoss::parse_firehose_loss(firehose_input)?;
             firehose_results.firehose_loss = firehose_loss;
             firehose_input = loss_data;
-        } else if unknown_log_activity_type == trace {
+        } else if log_activity_type == trace {
             let (trace_data, firehose_trace) = FirehoseTrace::parse_firehose_trace(firehose_input)?;
             firehose_results.firehose_trace = firehose_trace;
             firehose_input = trace_data;
 
             firehose_results.message = firehose_results.firehose_trace.message_data.clone();
-        } else if unknown_log_activity_type == unknown_remnant_data {
+        } else if log_activity_type == remnant_data {
             return Ok((input, firehose_results));
         } else {
             warn!(
                 "[macos-unifiedlogs] Unknown log activity type: {} -  {} bytes left",
-                unknown_log_activity_type,
+                log_activity_type,
                 input.len()
             );
-            debug!("[macos-unifiedlogs] Firehose data: {:X?}", data);
+            debug!("[macos-unifiedlogs] Firehose data: {data:X?}");
             return Ok((input, firehose_results));
         }
 
@@ -504,14 +543,14 @@ impl FirehosePreamble {
             return Ok((input, firehose_results));
         }
 
-        let (firehose_input, unknown_item) = le_u8(firehose_input)?;
+        let (firehose_input, item) = le_u8(firehose_input)?;
         let (firehose_input, number_items) = le_u8(firehose_input)?;
 
-        firehose_results.unknown_item = unknown_item;
+        firehose_results.item = item;
         firehose_results.number_items = number_items;
 
         let (_, firehose_item_data) =
-            FirehosePreamble::collect_items(firehose_input, &number_items, &flags)?;
+            FirehosePreamble::collect_items(firehose_input, number_items, flags)?;
 
         firehose_results.message = firehose_item_data;
 
@@ -520,6 +559,16 @@ impl FirehosePreamble {
 
         // Verify we did not nom into remnant/junk data
         let padding_data = padding_size_8(data_size.into());
+        let padding_data = match u64_to_usize(padding_data) {
+            Some(p) => p,
+            None => {
+                error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                )));
+            }
+        };
         let (mut input, _) = take(padding_data)(input)?;
         if (padding_data as usize) > taken_data.len() {
             input = remaining_data;
@@ -531,15 +580,15 @@ impl FirehosePreamble {
     /// Parse Backtrace data for log entry (chunk). This only exists if `has_context_data` flag is set
     fn get_backtrace_data(data: &[u8]) -> nom::IResult<&[u8], Vec<String>> {
         let (input, _unknown_data) = take(3usize)(data)?;
-        let (input, uuid_count) = map(le_u8, usize::from)(input)?;
-        let (input, offset_count) = map(le_u16, usize::from)(input)?;
+        let (input, uuid_count) = map(le_u8, usize::from).parse(input)?;
+        let (input, offset_count) = map(le_u16, usize::from).parse(input)?;
 
-        let (input, uuid_vec) = many_m_n(uuid_count, uuid_count, be_u128)(input)?;
+        let (input, uuid_vec) = many_m_n(uuid_count, uuid_count, be_u128).parse(input)?;
 
-        let (input, offsets_vec) = many_m_n(offset_count, offset_count, le_u32)(input)?;
+        let (input, offsets_vec) = many_m_n(offset_count, offset_count, le_u32).parse(input)?;
 
         let (mut input, indexes) =
-            many_m_n(offset_count, offset_count, map(le_u8, usize::from))(input)?;
+            many_m_n(offset_count, offset_count, map(le_u8, usize::from)).parse(input)?;
 
         let backtrace_data = indexes
             .iter()
@@ -554,6 +603,16 @@ impl FirehosePreamble {
             .collect::<Vec<String>>();
 
         let padding_size = padding_size_four(u64::try_from(offset_count).unwrap());
+        let padding_size = match u64_to_usize(padding_size) {
+            Some(p) => p,
+            None => {
+                error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                )));
+            }
+        };
         let (backtrace_input, _) = take(padding_size)(input)?;
         input = backtrace_input;
 
@@ -563,11 +622,11 @@ impl FirehosePreamble {
     /// Get the strings, precision, and private (sensitive) firehose message items
     fn get_firehose_items(data: &[u8]) -> nom::IResult<&[u8], FirehoseItemType> {
         let (firehost_input, item_type) = le_u8(data)?;
-        let (mut firehose_input, item_size) = le_u8(firehost_input)?;
+        let (mut firehose_input, item_type_size) = le_u8(firehost_input)?;
 
         let mut item = FirehoseItemType {
             item_type,
-            item_size,
+            item_type_size,
             ..Default::default()
         };
 
@@ -586,15 +645,21 @@ impl FirehosePreamble {
             let (input, message_size) = le_u16(input)?;
 
             item.offset = message_offset;
-            item.message_string_size = message_size;
+            item.item_size = message_size;
+            item.item = FirehoseItem::String;
             firehose_input = input;
+        }
+
+        if item.item_type == PRIVATE_NUMBER {
+            item.item = FirehoseItem::PrivateNumber;
         }
 
         // Precision items just contain the length for the actual item. Ex: %*s
         const PRECISION_ITEMS: [u8; 2] = [0x10, 0x12];
         if PRECISION_ITEMS.contains(&item.item_type) {
-            let (input, _) = take(item.item_size)(firehose_input)?;
+            let (input, _) = take(item.item_type_size)(firehose_input)?;
             firehose_input = input;
+            item.item = FirehoseItem::Precision;
         }
 
         const SENSITIVE_ITEMS: [u8; 3] = [0x5, 0x45, 0x85];
@@ -603,38 +668,39 @@ impl FirehosePreamble {
             let (input, message_size) = le_u16(input)?;
 
             item.offset = message_offset;
-            item.message_string_size = message_size;
+            item.item_size = message_size;
+            item.item = FirehoseItem::Sensitive;
             firehose_input = input;
         }
         Ok((firehose_input, item))
     }
 
     /// Parse the item string
-    fn parse_item_string(
-        data: &[u8],
-        item_type: u8,
-        message_size: u16,
-    ) -> nom::IResult<&[u8], String> {
+    fn parse_item_string<'a>(
+        data: &'a [u8],
+        item: &mut FirehoseItemType,
+    ) -> nom::IResult<&'a [u8], String> {
         // If message item size is greater than the remaining data, just use the rest of the data
-        if message_size as usize > data.len() {
+        if item.item_size as usize > data.len() {
             return extract_string_size(data, data.len() as u64);
         }
 
-        let (input, message_data) = take(message_size)(data)?;
+        let (input, message_data) = take(item.item_size)(data)?;
 
         const ARBITRARY: [u8; 3] = [0x30, 0x31, 0x32];
         // 0x30, 0x31, and 0x32 represent arbitrary data, need to be decoded again
         // Ex: name: %{private, mask.hash, mdnsresponder:domain_name}.*P, type: A, rdata: %{private, mask.hash, network:in_addr}.4P
-        if ARBITRARY.contains(&item_type) {
+        if ARBITRARY.contains(&item.item_type) {
+            item.item = FirehoseItem::Object;
             return Ok((input, encode_standard(message_data)));
         }
 
         const BASE64_RAW_BYTES: u8 = 0xf2;
-        if item_type == BASE64_RAW_BYTES {
+        if item.item_type == BASE64_RAW_BYTES {
             return Ok((input, encode_standard(message_data)));
         }
 
-        let (_, message_string) = extract_string_size(message_data, u64::from(message_size))?;
+        let (_, message_string) = extract_string_size(message_data, u64::from(item.item_size))?;
         Ok((input, message_string))
     }
 
@@ -642,16 +708,13 @@ impl FirehosePreamble {
     fn parse_item_number(data: &[u8], item_size: u16) -> nom::IResult<&[u8], i64> {
         let input = data;
         Ok(match item_size {
-            4 => map(le_i32, i64::from)(input)?,
-            2 => map(le_i16, i64::from)(input)?,
+            4 => map(le_i32, i64::from).parse(input)?,
+            2 => map(le_i16, i64::from).parse(input)?,
             8 => le_i64(input)?,
-            1 => map(le_i8, i64::from)(input)?,
+            1 => map(le_i8, i64::from).parse(input)?,
             _ => {
-                warn!(
-                    "[macos-unifiedlogs] Unknown number size support: {:?}",
-                    item_size
-                );
-                debug!("[macos-unifiedlogs] Item data: {:?}", data);
+                warn!("[macos-unifiedlogs] Unknown number size support: {item_size:?}");
+                debug!("[macos-unifiedlogs] Item data: {data:?}");
                 (input, -9999)
             }
         })
@@ -662,7 +725,9 @@ impl FirehosePreamble {
 mod tests {
     use std::{fs::File, io::Read, path::PathBuf};
 
-    use super::{FirehoseItemData, FirehoseItemInfo, FirehosePreamble};
+    use crate::chunks::firehose::firehose_log::{FirehoseItem, FirehoseItemType};
+
+    use super::{FirehoseItemData, FirehosePreamble};
 
     #[test]
     fn test_parse_firehose_preamble() {
@@ -2782,19 +2847,19 @@ mod tests {
         ];
 
         let (_, firehose) = FirehosePreamble::parse_firehose(&test_firehose_data).unwrap();
-        assert_eq!(firehose.unknown_log_activity_type, 4);
-        assert_eq!(firehose.unknown_log_type, 0);
+        assert_eq!(firehose.log_activity_type, 4);
+        assert_eq!(firehose.log_type, 0);
         assert_eq!(firehose.flags, 557);
         assert_eq!(firehose.format_string_location, 304082752);
         assert_eq!(firehose.thread_id, 60238);
         assert_eq!(firehose.continous_time_delta, 589618615);
         assert_eq!(firehose.continous_time_delta_upper, 16);
         assert_eq!(firehose.data_size, 99);
-        assert_eq!(firehose.firehose_non_activity.unknown_activity_id, 64444);
-        assert_eq!(firehose.firehose_non_activity.unknown_sentinal, 2147483648);
+        assert_eq!(firehose.firehose_non_activity.activity_id, 64444);
+        assert_eq!(firehose.firehose_non_activity.sentinal, 2147483648);
         assert_eq!(firehose.firehose_non_activity.private_strings_offset, 0);
         assert_eq!(firehose.firehose_non_activity.private_strings_size, 0);
-        assert_eq!(firehose.firehose_non_activity.unknown_message_string_ref, 0);
+        assert_eq!(firehose.firehose_non_activity.message_string_ref, 0);
         assert!(!firehose.firehose_non_activity.firehose_formatters.main_exe);
 
         assert_eq!(firehose.firehose_non_activity.subsystem_value, 14);
@@ -2814,8 +2879,8 @@ mod tests {
                 .has_large_offset,
             1
         );
-        assert_eq!(firehose.firehose_non_activity.unknown_pc_id, 303680198);
-        assert_eq!(firehose.unknown_item, 34);
+        assert_eq!(firehose.firehose_non_activity.pc_id, 303680198);
+        assert_eq!(firehose.item, 34);
         assert_eq!(firehose.number_items, 1);
         assert_eq!(
             firehose.message.item_info[0].message_strings,
@@ -2878,9 +2943,9 @@ mod tests {
         ];
         let (_, results) = FirehosePreamble::get_firehose_items(&test_data).unwrap();
         assert_eq!(results.item_type, 66);
-        assert_eq!(results.item_size, 4);
+        assert_eq!(results.item_type_size, 4);
         assert_eq!(results.offset, 0);
-        assert_eq!(results.message_string_size, 73);
+        assert_eq!(results.item_size, 73);
     }
 
     #[test]
@@ -2894,10 +2959,15 @@ mod tests {
     #[test]
     fn test_parse_item_string() {
         let test_data = [55, 57, 54, 46, 49, 48, 48, 0];
-        let test_item = 34;
-        let test_size = 8;
-        let (_, results) =
-            FirehosePreamble::parse_item_string(&test_data, test_item, test_size).unwrap();
+        let mut test = FirehoseItemType {
+            item_type: 34,
+            item_type_size: 0,
+            item_size: 8,
+            item: FirehoseItem::Unknown,
+            offset: 0,
+            message_strings: String::new(),
+        };
+        let (_, results) = FirehosePreamble::parse_item_string(&test_data, &mut test).unwrap();
         assert_eq!(results, "796.100");
     }
 
@@ -2930,8 +3000,8 @@ mod tests {
         assert_eq!(firehose.base_continous_time, 0);
 
         assert_eq!(firehose.public_data.len(), 1);
-        assert_eq!(firehose.public_data[0].unknown_log_activity_type, 4);
-        assert_eq!(firehose.public_data[0].unknown_log_type, 0);
+        assert_eq!(firehose.public_data[0].log_activity_type, 4);
+        assert_eq!(firehose.public_data[0].log_type, 0);
         assert_eq!(firehose.public_data[0].flags, 258);
         assert_eq!(firehose.public_data[0].format_string_location, 16144);
         assert_eq!(firehose.public_data[0].thread_id, 957);
@@ -2939,18 +3009,8 @@ mod tests {
         assert_eq!(firehose.public_data[0].continous_time_delta, 478486415);
         assert_eq!(firehose.public_data[0].data_size, 16);
 
-        assert_eq!(
-            firehose.public_data[0]
-                .firehose_non_activity
-                .unknown_activity_id,
-            0
-        );
-        assert_eq!(
-            firehose.public_data[0]
-                .firehose_non_activity
-                .unknown_sentinal,
-            0
-        );
+        assert_eq!(firehose.public_data[0].firehose_non_activity.activity_id, 0);
+        assert_eq!(firehose.public_data[0].firehose_non_activity.sentinal, 0);
         assert_eq!(
             firehose.public_data[0]
                 .firehose_non_activity
@@ -2966,7 +3026,7 @@ mod tests {
         assert_eq!(
             firehose.public_data[0]
                 .firehose_non_activity
-                .unknown_message_string_ref,
+                .message_string_ref,
             0
         );
         assert_eq!(
@@ -2980,10 +3040,7 @@ mod tests {
             firehose.public_data[0].firehose_non_activity.data_ref_value,
             0
         );
-        assert_eq!(
-            firehose.public_data[0].firehose_non_activity.unknown_pc_id,
-            14968
-        );
+        assert_eq!(firehose.public_data[0].firehose_non_activity.pc_id, 14968);
 
         assert!(
             firehose.public_data[0]
@@ -3096,7 +3153,7 @@ mod tests {
         let firehose_number_items = 1;
         let firehose_flags = 513;
         let (_, results) =
-            FirehosePreamble::collect_items(&test_data, &firehose_number_items, &firehose_flags)
+            FirehosePreamble::collect_items(&test_data, firehose_number_items, firehose_flags)
                 .unwrap();
         assert_eq!(results.item_info[0].message_strings, "<private>");
         assert_eq!(results.item_info[0].item_type, 65);
@@ -3140,7 +3197,7 @@ mod tests {
         let firehose_number_items = 1;
         let firehose_flags = 513;
         let (_, _) =
-            FirehosePreamble::collect_items(&test_data, &firehose_number_items, &firehose_flags)
+            FirehosePreamble::collect_items(&test_data, firehose_number_items, firehose_flags)
                 .unwrap();
     }
 
@@ -3161,15 +3218,19 @@ mod tests {
             item_info: Vec::new(),
             backtrace_strings: Vec::new(),
         };
-        let firehose_item: FirehoseItemInfo = FirehoseItemInfo {
+        let firehose_item = FirehoseItemType {
             message_strings: String::new(),
             item_type: 33,
             item_size: 161,
+            ..Default::default()
         };
         results.item_info.push(firehose_item);
         let (_, _) = FirehosePreamble::parse_private_data(&test_data, &mut results).unwrap();
 
-        assert_eq!(results.item_info[0].message_strings, "<SZExtractor<0x15780ee60> prepared:Y valid:Y pathEnding:com.apple.nsurlsessiond/CFNetworkDownload_yWh5k8.tmp error:(null)>: Supply bytes with length 65536 began")
+        assert_eq!(
+            results.item_info[0].message_strings,
+            "<SZExtractor<0x15780ee60> prepared:Y valid:Y pathEnding:com.apple.nsurlsessiond/CFNetworkDownload_yWh5k8.tmp error:(null)>: Supply bytes with length 65536 began"
+        )
     }
 
     #[test]
@@ -3179,10 +3240,11 @@ mod tests {
             item_info: Vec::new(),
             backtrace_strings: Vec::new(),
         };
-        let firehose_item: FirehoseItemInfo = FirehoseItemInfo {
+        let firehose_item = FirehoseItemType {
             message_strings: String::new(),
             item_type: 1,
             item_size: 8,
+            ..Default::default()
         };
         results.item_info.push(firehose_item);
         let (_, _) = FirehosePreamble::parse_private_data(&test_data, &mut results).unwrap();
@@ -3191,14 +3253,14 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_items_unknown_item() {
+    fn test_collect_items_item() {
         let test_data = [
             99, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0,
         ];
         let firehose_number_items = 1;
         let firehose_flags = 513;
         let (_, results) =
-            FirehosePreamble::collect_items(&test_data, &firehose_number_items, &firehose_flags)
+            FirehosePreamble::collect_items(&test_data, firehose_number_items, firehose_flags)
                 .unwrap();
         assert_eq!(results.item_info[0].message_strings, "");
         assert_eq!(results.item_info[0].item_type, 99);
@@ -3403,5 +3465,67 @@ mod tests {
             firehouse_result_count += firehose.public_data.len();
         }
         assert_eq!(firehouse_result_count, 66)
+    }
+
+    #[test]
+    fn test_firehose_private_number_string() {
+        let test = [
+            69, 114, 114, 111, 114, 32, 68, 111, 109, 97, 105, 110, 61, 82, 84, 69, 114, 114, 111,
+            114, 68, 111, 109, 97, 105, 110, 32, 67, 111, 100, 101, 61, 50, 32, 34, 83, 101, 114,
+            118, 105, 99, 101, 32, 104, 97, 115, 32, 98, 101, 101, 110, 32, 100, 105, 115, 97, 98,
+            108, 101, 100, 32, 98, 121, 32, 117, 115, 101, 114, 46, 34, 32, 85, 115, 101, 114, 73,
+            110, 102, 111, 61, 123, 78, 83, 76, 111, 99, 97, 108, 105, 122, 101, 100, 68, 101, 115,
+            99, 114, 105, 112, 116, 105, 111, 110, 61, 83, 101, 114, 118, 105, 99, 101, 32, 104,
+            97, 115, 32, 98, 101, 101, 110, 32, 100, 105, 115, 97, 98, 108, 101, 100, 32, 98, 121,
+            32, 117, 115, 101, 114, 46, 125, 0,
+        ];
+
+        let mut item = FirehoseItemData {
+            item_info: vec![
+                FirehoseItemType {
+                    message_strings: String::from("<private>"),
+                    item_type: 69,
+                    item_size: 0,
+                    ..Default::default()
+                },
+                FirehoseItemType {
+                    message_strings: String::new(),
+                    item_type: 1,
+                    item_size: 32768,
+                    ..Default::default()
+                },
+                FirehoseItemType {
+                    message_strings: String::new(),
+                    item_type: 1,
+                    item_size: 32768,
+                    ..Default::default()
+                },
+                FirehoseItemType {
+                    message_strings: String::from("<private>"),
+                    item_type: 65,
+                    item_size: 0,
+                    ..Default::default()
+                },
+                FirehoseItemType {
+                    message_strings: String::from("<private>"),
+                    item_type: 129,
+                    item_size: 140,
+                    ..Default::default()
+                },
+            ],
+            backtrace_strings: Vec::new(),
+        };
+
+        FirehosePreamble::parse_private_data(&test, &mut item).unwrap();
+
+        for entry in item.item_info {
+            if entry.message_strings == "<private>"
+                || entry.message_strings
+                    == "Error Domain=RTErrorDomain Code=2 \"Service has been disabled by user.\" UserInfo={NSLocalizedDescription=Service has been disabled by user.}"
+            {
+                continue;
+            }
+            panic!("Got wrong message strings: {entry:?}");
+        }
     }
 }

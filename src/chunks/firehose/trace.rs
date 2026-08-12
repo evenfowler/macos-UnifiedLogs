@@ -5,15 +5,13 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
+use crate::catalog::CatalogChunk;
+use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemType};
+use crate::chunks::firehose::message::MessageData;
+use crate::traits::{FileProvider, StringCache};
 use log::{error, warn};
 use nom::bytes::complete::take;
-use nom::number::complete::{be_u16, be_u32, be_u64, be_u8, le_u32, le_u8};
-use std::mem::size_of;
-
-use crate::catalog::CatalogChunk;
-use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemInfo};
-use crate::chunks::firehose::message::MessageData;
-use crate::uuidtext::UUIDText;
+use nom::number::complete::{be_u8, be_u16, be_u32, be_u64, le_u8, le_u32};
 
 #[derive(Debug, Clone, Default)]
 pub struct FirehoseTrace {
@@ -27,14 +25,12 @@ impl FirehoseTrace {
     pub fn parse_firehose_trace(data: &[u8]) -> nom::IResult<&[u8], FirehoseTrace> {
         let mut firehose_trace = FirehoseTrace::default();
 
-        let (input, unknown_pc_id) = take(size_of::<u32>())(data)?;
-        let (_, firehose_unknown_pc_id) = le_u32(unknown_pc_id)?;
+        let (input, firehose_unknown_pc_id) = le_u32(data)?;
+        firehose_trace.unknown_pc_id = firehose_unknown_pc_id;
 
         // Trace logs only have message values if more than 4 bytes remaining in log entry
         let minimum_message_size = 4;
         if input.len() < minimum_message_size {
-            let (_, firehose_unknown_pc_id) = le_u32(unknown_pc_id)?;
-            firehose_trace.unknown_pc_id = firehose_unknown_pc_id;
             let (input, _unknown_data) = take(input.len())(input)?;
 
             return Ok((input, firehose_trace));
@@ -47,7 +43,6 @@ impl FirehoseTrace {
         message_data.reverse();
         let message = FirehoseTrace::get_message(&message_data);
         firehose_trace.message_data = message;
-        firehose_trace.unknown_pc_id = firehose_unknown_pc_id;
 
         Ok((&[], firehose_trace))
     }
@@ -78,26 +73,20 @@ impl FirehoseTrace {
             return Ok((data, item_data));
         }
 
-        let (mut remaining_input, entries_data) = take(size_of::<u8>())(data)?;
-        let (_, entries) = le_u8(entries_data)?;
+        let (mut remaining_input, entries) = le_u8(data)?;
 
         let mut count = 0;
         let mut sizes_count = Vec::new();
         // based on number of entries get the size for each entry
         while count < entries {
-            let (input, size_data) = take(size_of::<u8>())(remaining_input)?;
-            let (_, size) = le_u8(size_data)?;
+            let (input, size) = le_u8(remaining_input)?;
             sizes_count.push(size);
             count += 1;
             remaining_input = input;
         }
 
         for entry_size in sizes_count {
-            let mut item_info = FirehoseItemInfo {
-                message_strings: String::new(),
-                item_type: 0,
-                item_size: 0,
-            };
+            let mut item_info = FirehoseItemType::default();
             // So far all entries appears to be numbers. Using Big Endian because we reversed the data above
             let (input, message_data) = take(entry_size as usize)(remaining_input)?;
             match entry_size {
@@ -118,7 +107,9 @@ impl FirehoseTrace {
                     item_info.message_strings = format!("{value}")
                 }
                 _ => {
-                    warn!("[macos-unifiedlogs] Unhandled size of trace data: {entry_size}. Defaulting to size of one");
+                    warn!(
+                        "[macos-unifiedlogs] Unhandled size of trace data: {entry_size}. Defaulting to size of one"
+                    );
                     let (_, unknown_size) = le_u8(message_data)?;
                     item_info.message_strings = format!("{unknown_size}")
                 }
@@ -133,16 +124,18 @@ impl FirehoseTrace {
     }
 
     /// Get base log message string formatter from shared cache strings (dsc) or UUID text file for firehose trace log entries (chunks)
-    pub fn get_firehose_trace_strings<'a>(
-        strings_data: &'a [UUIDText],
+    pub(crate) fn get_firehose_trace_strings(
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
         string_offset: u64,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+        first_proc_id: u64,
+        second_proc_id: u32,
         catalogs: &CatalogChunk,
-    ) -> nom::IResult<&'a [u8], MessageData> {
+    ) -> nom::IResult<&'static [u8], MessageData> {
         // Only main_exe flag has been seen for format strings
         MessageData::extract_format_strings(
-            strings_data,
+            provider,
+            cache,
             string_offset,
             first_proc_id,
             second_proc_id,
@@ -154,13 +147,10 @@ impl FirehoseTrace {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use crate::{
-        chunks::firehose::trace::FirehoseTrace,
-        filesystem::LogarchiveProvider,
-        parser::{collect_strings, parse_log},
+        chunks::firehose::trace::FirehoseTrace, filesystem::LogarchiveProvider, parser::parse_log,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_firehose_trace() {
@@ -206,25 +196,25 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-
-        let string_results = collect_strings(&provider).unwrap();
+        let cache = crate::cache::MemoryStringCache::default();
 
         test_path.push("logdata.LiveData.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
 
-        let log_data = parse_log(handle).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let activity_type = 0x3;
 
         for catalog_data in log_data.catalog_data {
             for preamble in catalog_data.firehose {
                 for firehose in preamble.public_data {
-                    if firehose.unknown_log_activity_type == activity_type {
+                    if firehose.log_activity_type == activity_type {
                         let (_, message_data) = FirehoseTrace::get_firehose_trace_strings(
-                            &string_results,
+                            &provider,
+                            &cache,
                             u64::from(firehose.format_string_location),
-                            &preamble.first_number_proc_id,
-                            &preamble.second_number_proc_id,
+                            preamble.first_number_proc_id,
+                            preamble.second_number_proc_id,
                             &catalog_data.catalog,
                         )
                         .unwrap();

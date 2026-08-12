@@ -5,9 +5,10 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use log::warn;
-
 /// Convert Darwin errno codes to message
+/// Two kinds of error objects in logs (from "man `os_log`")
+///   - {darwin.errno} = [2: "No such file or directory"]. Contains both number and error string
+///   - {errno} = "No such file or directory". Contains just the error string
 pub(crate) fn errno_codes(errno: &str) -> String {
     // Found at https://github.com/apple/darwin-xnu/blob/main/bsd/sys/errno.h
     let errno_message = match errno {
@@ -125,8 +126,35 @@ pub(crate) fn errno_codes(errno: &str) -> String {
         "-7" => "Keep looking",
         "-8" => "Data less",
         _ => {
-            warn!("[macos-unifiedlogs] Unknown darwin errno code: {}", errno);
-            return format!("Unknown errno: {}", errno);
+            // Unknown error codes are actually common in Unified Logs
+            // Ex: [0x97f0a6080] failed to do a bootstrap look-up: xpc_error=[159: Unknown error: 159]
+            return format!("Unknown errno: {errno}");
+        }
+    };
+
+    errno_message.to_string()
+}
+
+/// Kernel error codes. Have only seen "(ipc/send) invalid destination port"
+/// <https://www.koingosw.com/products/macpilot/error-codes.php?page=248>
+pub(crate) fn mach_codes(errno: &str) -> String {
+    let errno_message = match errno {
+        "268435459" => "(ipc/send) invalid destination port",
+        "268435472" => "invalid header",
+        "268435468" => "invalid memory",
+        "268435467" => "invalid notify",
+        "268435465" => "invalid reply",
+        "268435466" => "invalid right",
+        "4294967644" => "invalid rt ool size",
+        "268435473" => "invalid trailer",
+        "268435471" => "invalid type",
+        "268435461" => "invalid voucher",
+        "268435464" => "message too small",
+        "268435469" => "no buffer",
+        "268435460" => "timed out",
+        "268435470" => "too large",
+        _ => {
+            return format!("Unknown mach errno: {errno}");
         }
     };
 
@@ -138,14 +166,14 @@ pub(crate) fn permission(permissions: &str) -> String {
     let mut message = String::from("-");
     for bit in permissions.chars() {
         match bit {
-            '1' => message = format!("{}--x", message),
-            '2' => message = format!("{}-w-", message),
-            '4' => message = format!("{}r--", message),
-            '3' => message = format!("{}-wx", message),
-            '5' => message = format!("{}r-x", message),
-            '6' => message = format!("{}rw-", message),
-            '7' => message = format!("{}rwx", message),
-            _ => message = format!("{}---", message),
+            '1' => message = format!("{message}--x"),
+            '2' => message = format!("{message}-w-"),
+            '4' => message = format!("{message}r--"),
+            '3' => message = format!("{message}-wx"),
+            '5' => message = format!("{message}r-x"),
+            '6' => message = format!("{message}rw-"),
+            '7' => message = format!("{message}rwx"),
+            _ => message = format!("{message}---"),
         }
     }
     message
@@ -175,6 +203,25 @@ mod tests {
         test_data = "82";
         result = errno_codes(test_data);
         assert_eq!(result, "Device power is off");
+    }
+
+    #[test]
+    fn test_mach_errno_codes() {
+        let mut test_data = "268435465";
+        let mut result = mach_codes(test_data);
+        assert_eq!(result, "invalid reply");
+
+        test_data = "268435470";
+        result = mach_codes(test_data);
+        assert_eq!(result, "too large");
+
+        test_data = "268435469";
+        result = mach_codes(test_data);
+        assert_eq!(result, "no buffer");
+
+        test_data = "268435468";
+        result = mach_codes(test_data);
+        assert_eq!(result, "invalid memory");
     }
 
     #[test]

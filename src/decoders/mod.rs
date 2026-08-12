@@ -6,7 +6,8 @@
 // See the License for the specific language governing permissions and limitations under the License.
 
 mod bool;
-mod darwin;
+pub(crate) mod config;
+pub(crate) mod darwin;
 pub(crate) mod decoder;
 mod dns;
 pub(crate) mod location;

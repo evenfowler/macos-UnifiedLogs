@@ -5,16 +5,17 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use log::debug;
+use std::collections::HashMap;
+
 use crate::{preamble::LogPreamble, util::*};
+use log::error;
 use nom::{
+    IResult, Parser,
     bytes::complete::take,
     combinator::map,
-    error::{make_error, ErrorKind},
+    error::{ErrorKind, make_error},
     multi::many_m_n,
     number::complete::{be_u128, le_u16, le_u32, le_u64},
-    sequence::tuple,
-    IResult,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -37,7 +38,7 @@ pub struct CatalogChunk {
     pub catalog_uuids: Vec<String>,
     /// array of strings with end-of-string character
     pub catalog_subsystem_strings: Vec<u8>,
-    pub catalog_process_info_entries: Vec<ProcessInfoEntry>,
+    pub catalog_process_info_entries: HashMap<String, ProcessInfoEntry>,
     pub catalog_subchunks: Vec<CatalogSubchunk>,
 }
 
@@ -114,7 +115,7 @@ impl CatalogChunk {
     /// Parse log Catalog data. The log Catalog contains metadata related to log entries such as Process info, Subsystem info, and the compressed log entries
     pub fn parse_catalog(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, preamble) = LogPreamble::parse(input)?;
-
+        let mut tup = (le_u16, le_u16, le_u16, le_u16, le_u16);
         let (
             input,
             (
@@ -124,10 +125,10 @@ impl CatalogChunk {
                 catalog_offset_sub_chunks,
                 number_sub_chunks,
             ),
-        ) = tuple((le_u16, le_u16, le_u16, le_u16, le_u16))(input)?;
+        ) = tup.parse(input)?;
 
         const UNKNOWN_LENGTH: u8 = 6;
-        let (input, unknown) = map(take(UNKNOWN_LENGTH), |v: &[u8]| v.to_vec())(input)?;
+        let (input, unknown) = map(take(UNKNOWN_LENGTH), |v: &[u8]| v.to_vec()).parse(input)?;
         let (input, earliest_firehose_timestamp) = le_u64(input)?;
 
         const UUID_LENGTH: usize = 16;
@@ -137,24 +138,37 @@ impl CatalogChunk {
             number_catalog_uuids,
             number_catalog_uuids,
             map(be_u128, |x| format!("{x:032X}")),
-        )(input)?;
+        )
+        .parse(input)?;
 
         let subsystems_strings_length =
             catalog_process_info_entries_offset - catalog_subsystem_strings_offset;
         let (input, subsystem_strings_data) = take(subsystems_strings_length)(input)?;
         let catalog_subsystem_strings = subsystem_strings_data.to_vec();
 
-        let (input, catalog_process_info_entries) = many_m_n(
+        let (input, catalog_process_info_entries_vec) = many_m_n(
             number_process_information_entries as usize,
             number_process_information_entries as usize,
             |input| Self::parse_catalog_process_entry(input, &catalog_uuids),
-        )(input)?;
+        )
+        .parse(input)?;
 
+        let mut catalog_process_info_entries = HashMap::new();
+        for entry in catalog_process_info_entries_vec {
+            catalog_process_info_entries.insert(
+                format!(
+                    "{}_{}",
+                    entry.first_number_proc_id, entry.second_number_proc_id
+                ),
+                entry,
+            );
+        }
         let (input, catalog_subchunks) = many_m_n(
             number_sub_chunks as usize,
             number_sub_chunks as usize,
             Self::parse_catalog_subchunk,
-        )(input)?;
+        )
+        .parse(input)?;
         Ok((
             input,
             CatalogChunk {
@@ -181,25 +195,31 @@ impl CatalogChunk {
         input: &'a [u8],
         uuids: &[String],
     ) -> IResult<&'a [u8], ProcessInfoEntry> {
-        let (input, (index, unknown)) = tuple((le_u16, le_u16))(input)?;
-        let (input, (catalog_main_uuid_index, catalog_dsc_uuid_index)) =
-            tuple((le_u16, le_u16))(input)?;
-        let (input, (first_number_proc_id, second_number_proc_id)) =
-            tuple((le_u64, le_u32))(input)?;
+        let mut catlog_tup = (le_u16, le_u16);
+        let (input, (index, unknown)) = catlog_tup.parse(input)?;
+        let (input, (catalog_main_uuid_index, catalog_dsc_uuid_index)) = catlog_tup.parse(input)?;
+        let mut proc_tup = (le_u64, le_u32);
+        let (input, (first_number_proc_id, second_number_proc_id)) = proc_tup.parse(input)?;
+
+        let mut id_tup = (le_u32, le_u32, le_u32, le_u32, le_u32);
         let (input, (pid, effective_user_id, unknown2, number_uuids_entries, unknown3)) =
-            tuple((le_u32, le_u32, le_u32, le_u32, le_u32))(input)?;
+            id_tup.parse(input)?;
 
         let (input, uuid_info_entries) =
             many_m_n(number_uuids_entries as _, number_uuids_entries as _, |s| {
                 Self::parse_process_info_uuid_entry(s, uuids)
-            })(input)?;
-        let (input, (number_subsystems, unknown4)) = tuple((le_u32, le_u32))(input)?;
+            })
+            .parse(input)?;
+
+        let mut sub_tup = (le_u32, le_u32);
+        let (input, (number_subsystems, unknown4)) = sub_tup.parse(input)?;
 
         let (input, subsystem_entries) = many_m_n(
             number_subsystems as _,
             number_subsystems as _,
             Self::parse_process_info_subystem,
-        )(input)?;
+        )
+        .parse(input)?;
 
         // Grab parsed UUIDs from Catalag array based on process entry uuid index
         let main_uuid = uuids
@@ -209,18 +229,27 @@ impl CatalogChunk {
                 log::warn!("[macos-unifiedlogs] Could not find main UUID in catalog");
                 String::new()
             });
-        debug!("{}", &main_uuid);
 
         let dsc_uuid = uuids
             .get(catalog_dsc_uuid_index as usize)
             .map(ToString::to_string)
             .unwrap_or_else(|| {
-                log::warn!("[macos-unifiedlogs] Could not find DSC UUID in catalog");
+                //log::warn!("[macos-unifiedlogs] Could not find DSC UUID in catalog");
                 String::new()
             });
 
         const SUBSYSTEM_SIZE: u64 = 6;
         let padding = anticipated_padding_size_8(number_subsystems.into(), SUBSYSTEM_SIZE);
+        let padding = match u64_to_usize(padding) {
+            Some(p) => p,
+            None => {
+                error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                )));
+            }
+        };
         let (input, _) = take(padding)(input)?;
 
         Ok((
@@ -252,11 +281,12 @@ impl CatalogChunk {
         input: &'a [u8],
         uuids: &[String],
     ) -> IResult<&'a [u8], ProcessUUIDEntry> {
-        let (input, (size, unknown, catalog_uuid_index)) = tuple((le_u32, le_u32, le_u16))(input)?;
+        let mut tup = (le_u32, le_u32, le_u16);
+        let (input, (size, unknown, catalog_uuid_index)) = tup.parse(input)?;
 
         const LOAD_ADDRESS_SIZE: u8 = 6;
         let (input, mut load_address_vec) =
-            map(take(LOAD_ADDRESS_SIZE), |x: &[u8]| x.to_vec())(input)?;
+            map(take(LOAD_ADDRESS_SIZE), |x: &[u8]| x.to_vec()).parse(input)?;
         load_address_vec.push(0);
         load_address_vec.push(0);
         let load_address = match le_u64::<&[u8], ()>(&load_address_vec[..]) {
@@ -283,8 +313,8 @@ impl CatalogChunk {
 
     /// Parse the Catalog Subsystem metadata. This helps get the subsystem (App Bundle ID) and the log entry category
     fn parse_process_info_subystem(input: &[u8]) -> IResult<&[u8], ProcessInfoSubsystem> {
-        let (input, (identifer, subsystem_offset, category_offset)) =
-            tuple((le_u16, le_u16, le_u16))(input)?;
+        let mut tup = (le_u16, le_u16, le_u16);
+        let (input, (identifer, subsystem_offset, category_offset)) = tup.parse(input)?;
         Ok((
             input,
             ProcessInfoSubsystem {
@@ -297,15 +327,17 @@ impl CatalogChunk {
 
     /// Parse the Catalog Subchunk metadata. This metadata is related to the compressed (typically) Chunkset data
     fn parse_catalog_subchunk(input: &[u8]) -> IResult<&[u8], CatalogSubchunk> {
+        let mut tup = (le_u64, le_u64, le_u32, le_u32, le_u32);
         let (input, (start, end, uncompressed_size, compression_algorithmn, number_index)) =
-            tuple((le_u64, le_u64, le_u32, le_u32, le_u32))(input)?;
+            tup.parse(input)?;
 
         const LZ4_COMPRESSION: u32 = 256;
         if compression_algorithmn != LZ4_COMPRESSION {
             return Err(nom::Err::Error(make_error(input, ErrorKind::OneOf)));
         }
 
-        let (input, indexes) = many_m_n(number_index as _, number_index as _, le_u16)(input)?;
+        let (input, indexes) =
+            many_m_n(number_index as _, number_index as _, le_u16).parse(input)?;
 
         let (input, number_string_offsets) = le_u32(input)?;
 
@@ -313,13 +345,24 @@ impl CatalogChunk {
             number_string_offsets as _,
             number_string_offsets as _,
             le_u16,
-        )(input)?;
+        )
+        .parse(input)?;
 
         // calculate amount of padding needed based on number_string_offsets and number_index
         const OFFSET_SIZE: u64 = 2;
         let padding =
             anticipated_padding_size_8((number_index + number_string_offsets).into(), OFFSET_SIZE);
 
+        let padding = match u64_to_usize(padding) {
+            Some(p) => p,
+            None => {
+                error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TooLarge,
+                )));
+            }
+        };
         let (input, _) = take(padding)(input)?;
 
         Ok((
@@ -349,42 +392,37 @@ impl CatalogChunk {
             category: String::new(),
         };
 
-        // Go through catalog entries until first and second proc id match the log entry
-        for process_info in &self.catalog_process_info_entries {
-            if first_proc_id == process_info.first_number_proc_id
-                && second_proc_id == process_info.second_number_proc_id
-            {
-                // Go through subsystems in catalog entry until subsystem value is found
-                for subsystems in &process_info.subsystem_entries {
-                    if subsystem_value == subsystems.identifer {
-                        let subsystem_data: &[u8] = &self.catalog_subsystem_strings;
-                        let (input, _) = take(subsystems.subsystem_offset)(subsystem_data)?;
-                        let (_, subsystem_string) = extract_string(input)?;
+        if let Some(entry) = self
+            .catalog_process_info_entries
+            .get(&format!("{first_proc_id}_{second_proc_id}"))
+        {
+            for subsystems in &entry.subsystem_entries {
+                if subsystem_value == subsystems.identifer {
+                    let subsystem_data: &[u8] = &self.catalog_subsystem_strings;
+                    let (input, _) = take(subsystems.subsystem_offset)(subsystem_data)?;
+                    let (_, subsystem_string) = extract_string(input)?;
 
-                        let (input, _) = take(subsystems.category_offset)(subsystem_data)?;
-                        let (_, category_string) = extract_string(input)?;
-                        subsystem_info.subsystem = subsystem_string;
-                        subsystem_info.category = category_string;
-                        return Ok((input, subsystem_info));
-                    }
+                    let (input, _) = take(subsystems.category_offset)(subsystem_data)?;
+                    let (_, category_string) = extract_string(input)?;
+                    subsystem_info.subsystem = subsystem_string;
+                    subsystem_info.category = category_string;
+                    return Ok((input, subsystem_info));
                 }
             }
         }
 
-        log::warn!("[macos-unifiedlogs] Did not find subsystem in log entry");
+        //log::warn!("[macos-unifiedlogs] Did not find subsystem in log entry");
         subsystem_info.subsystem = String::from("Unknown subsystem");
         Ok((&[], subsystem_info))
     }
 
     /// Get the actual Process ID associated with log entry
     pub fn get_pid(&self, first_proc_id: u64, second_proc_id: u32) -> u64 {
-        // Go through catalog entries until first and second proc id match the log entry
-        for process_info in &self.catalog_process_info_entries {
-            if first_proc_id == process_info.first_number_proc_id
-                && second_proc_id == process_info.second_number_proc_id
-            {
-                return u64::from(process_info.pid);
-            }
+        if let Some(entry) = self
+            .catalog_process_info_entries
+            .get(&format!("{first_proc_id}_{second_proc_id}"))
+        {
+            return u64::from(entry.pid);
         }
 
         log::warn!("[macos-unifiedlogs] Did not find PID in log Catalog");
@@ -393,14 +431,13 @@ impl CatalogChunk {
 
     /// Get the effictive user id associated with log entry. Can be mapped to an account name
     pub fn get_euid(&self, first_proc_id: u64, second_proc_id: u32) -> u32 {
-        // Go through catalog entries until first and second proc id match the log entry
-        for process_info in &self.catalog_process_info_entries {
-            if first_proc_id == process_info.first_number_proc_id
-                && second_proc_id == process_info.second_number_proc_id
-            {
-                return process_info.effective_user_id;
-            }
+        if let Some(entry) = self
+            .catalog_process_info_entries
+            .get(&format!("{first_proc_id}_{second_proc_id}"))
+        {
+            return entry.effective_user_id;
         }
+
         log::warn!("[macos-unifiedlogs] Did not find EUID in log Catalog");
         0
     }
@@ -468,11 +505,19 @@ mod tests {
         );
         assert_eq!(catalog_data.catalog_process_info_entries.len(), 1);
         assert_eq!(
-            catalog_data.catalog_process_info_entries[0].main_uuid,
+            catalog_data
+                .catalog_process_info_entries
+                .get("158_311")
+                .unwrap()
+                .main_uuid,
             "2BEFD20C18EC3838814F2B4E5AF3BCEC"
         );
         assert_eq!(
-            catalog_data.catalog_process_info_entries[0].dsc_uuid,
+            catalog_data
+                .catalog_process_info_entries
+                .get("158_311")
+                .unwrap()
+                .dsc_uuid,
             "3D05845F3F65358F9EBF2236E772AC01"
         );
 
@@ -619,10 +664,7 @@ mod tests {
             68, 234, 2, 0, 119, 171, 170, 119, 76, 234, 2, 0, 240, 254, 0, 0, 0, 1, 0, 0, 1, 0, 0,
             0, 0, 0, 3, 0, 0, 0, 0, 0, 19, 0, 47, 0,
         ];
-        assert!(matches!(
-            CatalogChunk::parse_catalog_subchunk(test_bad_compression),
-            Err(_)
-        ));
+        assert!(CatalogChunk::parse_catalog_subchunk(test_bad_compression).is_err());
     }
 
     #[test]
