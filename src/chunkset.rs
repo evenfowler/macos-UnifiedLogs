@@ -5,22 +5,20 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use std::mem::size_of;
-
 use log::{error, warn};
 use lz4_flex::decompress;
 use nom::{
+    Needed,
     bytes::complete::{take, take_while},
     number::complete::{le_u32, le_u64},
-    Needed,
 };
 
-use crate::chunks::firehose::firehose_log::FirehosePreamble;
-use crate::chunks::simpledump::SimpleDump;
 use crate::chunks::statedump::Statedump;
+use crate::{chunks::firehose::firehose_log::FirehosePreamble, util::u64_to_usize};
 use crate::{
     chunks::oversize::Oversize, preamble::LogPreamble, unified_log::UnifiedLogCatalogData,
 };
+use crate::{chunks::simpledump::SimpleDump, lzbitmap::lzbitmap_decompress};
 
 #[derive(Debug, Default)]
 pub struct ChunksetChunk {
@@ -39,17 +37,11 @@ impl ChunksetChunk {
     pub fn parse_chunkset(data: &[u8]) -> nom::IResult<&[u8], ChunksetChunk> {
         let mut chunkset_chunk = ChunksetChunk::default();
 
-        let (input, chunk_tag) = take(size_of::<u32>())(data)?;
-        let (input, chunk_sub_tag) = take(size_of::<u32>())(input)?;
-        let (input, chunk_data_size) = take(size_of::<u64>())(input)?;
-        let (input, signature) = take(size_of::<u32>())(input)?;
-        let (input, uncompress_size) = take(size_of::<u32>())(input)?;
-
-        let (_, chunkset_chunk_tag) = le_u32(chunk_tag)?;
-        let (_, chunkset_chunk_sub_tag) = le_u32(chunk_sub_tag)?;
-        let (_, chunkset_chunk_data_size) = le_u64(chunk_data_size)?;
-        let (_, chunkset_sig) = le_u32(signature)?;
-        let (_, chunkset_uncompress_size) = le_u32(uncompress_size)?;
+        let (input, chunkset_chunk_tag) = le_u32(data)?;
+        let (input, chunkset_chunk_sub_tag) = le_u32(input)?;
+        let (chunk_input, chunkset_chunk_data_size) = le_u64(input)?;
+        let (input, chunkset_sig) = le_u32(chunk_input)?;
+        let (input, chunkset_uncompress_size) = le_u32(input)?;
 
         let bv41 = 825521762; // bv41 signature
         let bv41_uncompressed = 758412898; // bv41- signature
@@ -58,23 +50,34 @@ impl ChunksetChunk {
         if chunkset_sig == bv41_uncompressed {
             let (input, uncompressed_data) = take(chunkset_uncompress_size)(input)?;
             chunkset_chunk.decompressed_data = uncompressed_data.to_vec();
-            let (input, footer) = take(size_of::<u32>())(input)?;
-            let (_, chunkset_footer) = le_u32(footer)?;
+            let (input, chunkset_footer) = le_u32(input)?;
             chunkset_chunk.footer = chunkset_footer;
             return Ok((input, chunkset_chunk));
         }
 
-        // Compressed data signatue should be bv41
+        // Only two likely to exist
+        let lzbitmap_sigs = [206389850, 156058202, 223167066, 139280986];
+        if lzbitmap_sigs.contains(&chunkset_sig) {
+            let (input, decom_bytes) = lzbitmap_decompress(chunk_input)?;
+            // Always [6, 0, 0, 0, 0, 0]?
+            // Maybe its a version number?
+            let (input, chunkset_footer) = le_u32(input)?;
+
+            chunkset_chunk.decompressed_data = decom_bytes;
+            chunkset_chunk.footer = chunkset_footer;
+
+            return Ok((input, chunkset_chunk));
+        }
+
+        // Compressed data signature should be bv41
         if chunkset_sig != bv41 {
             error!(
-                "[macos-unifiedlogs] Incorrect compression signature expected bv41, got: {:?}",
-                chunkset_sig
+                "[macos-unifiedlogs] Incorrect compression signature expected bv41, got: {chunkset_sig:?}"
             );
             return Err(nom::Err::Incomplete(Needed::Unknown));
         }
 
-        let (input, block_size) = take(size_of::<u32>())(input)?;
-        let (_, chunkset_block_size) = le_u32(block_size)?;
+        let (input, chunkset_block_size) = le_u32(input)?;
 
         chunkset_chunk.chunk_tag = chunkset_chunk_tag;
         chunkset_chunk.chunk_sub_tag = chunkset_chunk_sub_tag;
@@ -91,16 +94,12 @@ impl ChunksetChunk {
         match decompress_data_results {
             Ok(decompress_data) => chunkset_chunk.decompressed_data = decompress_data,
             Err(err) => {
-                error!(
-                    "[macos-unifiedlogs] Failed to decompress log data: {:?}",
-                    err
-                );
+                error!("[macos-unifiedlogs] Failed to decompress log data: {err:?}");
                 return Err(nom::Err::Incomplete(Needed::Unknown));
             }
         }
 
-        let (input, footer) = take(size_of::<u32>())(input)?;
-        let (_, chunkset_footer) = le_u32(footer)?;
+        let (input, chunkset_footer) = le_u32(input)?;
         chunkset_chunk.footer = chunkset_footer;
 
         Ok((input, chunkset_chunk))
@@ -120,6 +119,16 @@ impl ChunksetChunk {
             let chunk_size = preamble.chunk_data_size;
 
             // Grab all data associated with log (chunk) data
+            let chunk_size = match u64_to_usize(chunk_size) {
+                Some(c) => c,
+                None => {
+                    error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        data,
+                        nom::error::ErrorKind::TooLarge,
+                    )));
+                }
+            };
             let (data, chunk_data) = take(chunk_size + chunk_preamble_size)(input)?;
             ChunksetChunk::get_chunkset_data(chunk_data, preamble.chunk_tag, unified_log_data);
 
@@ -130,7 +139,7 @@ impl ChunksetChunk {
             }
 
             input = remaining_data;
-            if input.len() < chunk_preamble_size as usize {
+            if input.len() < chunk_preamble_size {
                 warn!(
                     "[macos-unifiedlogs] Not enough data for Chunkset preamble header, needed 16 bytes. Got: {:?}",
                     input.len()
@@ -157,8 +166,7 @@ impl ChunksetChunk {
             match firehose_results {
                 Ok((_, firehose_data)) => unified_log_data.firehose.push(firehose_data),
                 Err(err) => error!(
-                    "[macos-unifiedlogs] Failed to parse firehose log entry (chunk): {:?}",
-                    err
+                    "[macos-unifiedlogs] Failed to parse firehose log entry (chunk): {err:?}"
                 ),
             }
         } else if chunk_type == oversize_chunk {
@@ -166,8 +174,7 @@ impl ChunksetChunk {
             match oversize_results {
                 Ok((_, oversize)) => unified_log_data.oversize.push(oversize),
                 Err(err) => error!(
-                    "[macos-unifiedlogs] Failed to parse oversize log entry (chunk): {:?}",
-                    err
+                    "[macos-unifiedlogs] Failed to parse oversize log entry (chunk): {err:?}"
                 ),
             }
         } else if chunk_type == statedump_chunk {
@@ -175,8 +182,7 @@ impl ChunksetChunk {
             match statedump_results {
                 Ok((_, statedump)) => unified_log_data.statedump.push(statedump),
                 Err(err) => error!(
-                    "[macos-unifiedlogs] Failed to parse statedump log entry (chunk): {:?}",
-                    err
+                    "[macos-unifiedlogs] Failed to parse statedump log entry (chunk): {err:?}"
                 ),
             }
         } else if chunk_type == simpledump_chunk {
@@ -184,15 +190,11 @@ impl ChunksetChunk {
             match simpledump_results {
                 Ok((_, simpledump)) => unified_log_data.simpledump.push(simpledump),
                 Err(err) => error!(
-                    "[macos-unifiedlogs] Failed to parse simpledump log entry (chunk): {:?}",
-                    err
+                    "[macos-unifiedlogs] Failed to parse simpledump log entry (chunk): {err:?}"
                 ),
             }
         } else {
-            error!(
-                "[macos-unifiedlogs] Unknown chunkset type: {:?}",
-                chunk_type
-            );
+            error!("[macos-unifiedlogs] Unknown chunkset type: {chunk_type:?}");
         }
     }
 }
@@ -202,6 +204,7 @@ mod tests {
     use super::ChunksetChunk;
     use crate::catalog::CatalogChunk;
     use crate::unified_log::UnifiedLogCatalogData;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -2219,7 +2222,7 @@ mod tests {
                 earliest_firehose_timestamp: 0,
                 catalog_uuids: Vec::new(),
                 catalog_subsystem_strings: Vec::new(),
-                catalog_process_info_entries: Vec::new(),
+                catalog_process_info_entries: HashMap::new(),
                 catalog_subchunks: Vec::new(),
             },
             firehose: Vec::new(),
@@ -2266,7 +2269,7 @@ mod tests {
                 earliest_firehose_timestamp: 0,
                 catalog_uuids: Vec::new(),
                 catalog_subsystem_strings: Vec::new(),
-                catalog_process_info_entries: Vec::new(),
+                catalog_process_info_entries: HashMap::new(),
                 catalog_subchunks: Vec::new(),
             },
             firehose: Vec::new(),
@@ -2381,5 +2384,49 @@ mod tests {
             "user/501/com.apple.mdworker.shared.0B000000-0000-0000-0000-000000000000 [4229]"
         );
         assert_eq!(unified_log.simpledump[0].first_proc_id, 1);
+    }
+
+    //#[test]
+    fn test_parse_goldengate_chunkset() {
+        let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        test_path.push("tests/test_data/Chunkset Tests/goldengate_chunkset.raw");
+
+        let buffer = fs::read(test_path).unwrap();
+        let mut unified_log = UnifiedLogCatalogData {
+            catalog: CatalogChunk {
+                chunk_tag: 0,
+                chunk_sub_tag: 0,
+                chunk_data_size: 0,
+                catalog_subsystem_strings_offset: 0,
+                catalog_process_info_entries_offset: 0,
+                number_process_information_entries: 0,
+                catalog_offset_sub_chunks: 0,
+                number_sub_chunks: 0,
+                unknown: Vec::new(),
+                earliest_firehose_timestamp: 0,
+                catalog_uuids: Vec::new(),
+                catalog_subsystem_strings: Vec::new(),
+                catalog_process_info_entries: HashMap::new(),
+                catalog_subchunks: Vec::new(),
+            },
+            firehose: Vec::new(),
+            simpledump: Vec::new(),
+            statedump: Vec::new(),
+            oversize: Vec::new(),
+        };
+
+        let (_, _) = ChunksetChunk::parse_chunkset_data(&buffer, &mut unified_log).unwrap();
+        assert_eq!(unified_log.oversize.len(), 0);
+        assert_eq!(unified_log.firehose.len(), 4);
+
+        assert_eq!(
+            unified_log.firehose[2].public_data[0].message.item_info[0].message_strings,
+            "535313532480"
+        );
+        assert_eq!(unified_log.firehose[2].base_continous_time, 0);
+        assert_eq!(unified_log.firehose[2].first_number_proc_id, 338);
+        assert_eq!(unified_log.firehose[2].second_number_proc_id, 979);
+        assert_eq!(unified_log.firehose[2].public_data_size, 2568);
+        assert_eq!(unified_log.firehose[2].private_data_virtual_offset, 4096);
     }
 }

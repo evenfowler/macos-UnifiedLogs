@@ -8,15 +8,14 @@
 use crate::util::decode_standard;
 
 use super::{
-    bool::{lowercase_bool, lowercase_int_bool},
     DecoderError,
+    bool::{lowercase_bool, lowercase_int_bool},
 };
 use log::warn;
 use nom::{
+    IResult, Parser,
     bytes::complete::take,
-    number::complete::{le_f64, le_i32, le_i64, le_u32, le_u8},
-    sequence::tuple,
-    IResult,
+    number::complete::{le_f64, le_i32, le_i64, le_u8, le_u32},
 };
 
 #[derive(Debug, Default)]
@@ -93,19 +92,21 @@ pub(crate) fn daemon_status_type(status: &str) -> Result<String, DecoderError<'_
 pub(crate) fn subharvester_identifier(status: &str) -> Result<String, DecoderError<'_>> {
     // Found in dyldcache liblog
     let message = match status {
-        "1" => "Wifi",
-        "2" => "Tracks",
-        "3" => "Realtime",
-        "4" => "App",
-        "5" => "Pass",
-        "6" => "Indoor",
-        "7" => "Pressure",
-        "8" => "Poi",
-        "9" => "Trace",
-        "10" => "Avenger",
-        "11" => "Altimeter",
-        "12" => "Ionosphere",
-        "13" => "Unknown",
+        "0" => "CellLegacy",
+        "1" => "Cell",
+        "2" => "Wifi",
+        "3" => "Tracks",
+        "4" => "Realtime",
+        "5" => "App",
+        "6" => "Pass",
+        "7" => "Indoor",
+        "8" => "Pressure",
+        "9" => "Poi",
+        "10" => "Trace",
+        "11" => "Avenger",
+        "12" => "Altimeter",
+        "13" => "Ionosphere",
+        "14" => "Unknown",
         _ => {
             return Err(DecoderError::Parse {
                 input: status.as_bytes(),
@@ -114,7 +115,7 @@ pub(crate) fn subharvester_identifier(status: &str) -> Result<String, DecoderErr
             });
         }
     };
-    Ok(message.to_string())
+    Ok(format!("{:?}", message.to_string()))
 }
 
 /// Convert Core Location SQLITE code to string
@@ -173,10 +174,7 @@ fn get_sqlite_data(input: &[u8]) -> IResult<&[u8], &'static str> {
         101 => "SQLITE DONE",
         266 => "SQLITE IO ERR READ",
         _ => {
-            warn!(
-                "[macos-unifiedlogs] Unknown Core Location sqlite error: {}",
-                sqlite_code
-            );
+            warn!("[macos-unifiedlogs] Unknown Core Location sqlite error: {sqlite_code}");
             "Unknown Core Location sqlite error"
         }
     };
@@ -203,12 +201,13 @@ pub(crate) fn client_manager_state_tracker_state(input: &str) -> Result<String, 
 
 /// Get the tracker data
 pub(crate) fn get_state_tracker_data(input: &[u8]) -> IResult<&[u8], String> {
-    let (input, (location_enabled, location_restricted)) = tuple((le_u32, le_u32))(input)?;
+    let mut tup = (le_u32, le_u32);
+    let (input, (location_enabled, location_restricted)) = tup.parse(input)?;
     Ok((
         input,
         format!(
             "{{\"locationRestricted\":{}, \"locationServicesenabledStatus\":{}}}",
-            lowercase_bool(&format!("{}", location_restricted)),
+            lowercase_bool(&format!("{location_restricted}")),
             location_enabled
         ),
     ))
@@ -243,6 +242,7 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
     // padding? Reserved?
     const UNKONWN_DATA_LENGTH2: usize = 7;
 
+    let mut accuracy_tup = (le_f64, le_f64, le_u8, le_u8, le_u8, le_u8, le_u8);
     let (
         input,
         (
@@ -254,8 +254,9 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
             updating_ranging,
             updating_heading,
         ),
-    ) = tuple((le_f64, le_f64, le_u8, le_u8, le_u8, le_u8, le_u8))(input)?;
+    ) = accuracy_tup.parse(input)?;
 
+    let mut dynamic_tup = (take(UNKNOWN_DATA_LENGTH), le_f64, le_u8, le_u8, le_u8);
     let (
         input,
         (
@@ -265,8 +266,16 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
             allows_altered_locations,
             dynamic_accuracy,
         ),
-    ) = tuple((take(UNKNOWN_DATA_LENGTH), le_f64, le_u8, le_u8, le_u8))(input)?;
+    ) = dynamic_tup.parse(input)?;
 
+    let mut track_tup = (
+        le_u8,
+        le_i32,
+        le_u8,
+        take(UNKONWN_DATA_LENGTH2),
+        le_i64,
+        le_i32,
+    );
     let (
         input,
         (
@@ -277,19 +286,13 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
             activity_type,
             pauses_location_updates,
         ),
-    ) = tuple((
-        le_u8,
-        le_i32,
-        le_u8,
-        take(UNKONWN_DATA_LENGTH2),
-        le_i64,
-        le_i32,
-    ))(input)?;
+    ) = track_tup.parse(input)?;
 
+    let mut back_tup = (le_u8, le_u8, le_u8, le_u8);
     let (
         input,
         (paused, allows_background_updates, shows_background_location, allows_map_correction),
-    ) = tuple((le_u8, le_u8, le_u8, le_u8))(input)?;
+    ) = back_tup.parse(input)?;
 
     let location_data = input;
 
@@ -325,6 +328,7 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
         return Ok((location_data, location_tracker_object(&tracker)));
     }
 
+    let mut location_tup = (le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8);
     let (
         input,
         (
@@ -337,7 +341,7 @@ pub(crate) fn get_location_tracker_state(input: &[u8]) -> nom::IResult<&[u8], St
             courtesy_prompt,
             is_authorized_for_widgets,
         ),
-    ) = tuple((le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8, le_u8))(input)?;
+    ) = location_tup.parse(input)?;
 
     let tracker = LocationTrackerState {
         batching_location,
@@ -459,18 +463,22 @@ pub(crate) fn io_message(data: &str) -> Result<&'static str, DecoderError<'_>> {
 
 /// Parse and get the location Daemon tracker
 pub(crate) fn get_daemon_status_tracker(input: &[u8]) -> nom::IResult<&[u8], String> {
-    // https://gist.github.com/razvand/578f94748b624f4d47c1533f5a02b095
-    const RESERVED_SIZE: usize = 9;
-
+    // Slightly outdated but still helpful: https://gist.github.com/razvand/578f94748b624f4d47c1533f5a02b095
+    let mut tup = (
+        le_f64, le_u8, le_u8, le_u8, le_u8, le_u32, le_u32, le_u32, le_u32, le_i32, le_u8, le_u8,
+        le_u8, le_u8,
+    );
     let (
         location_data,
         (
             level,
             charged,
             connected,
+            _unknown,
+            _unknown2,
             charger_type,
-            was_connected,
-            _reserved,
+            _unknown3,
+            _unknown4,
             reachability,
             thermal_level,
             airplane,
@@ -478,53 +486,45 @@ pub(crate) fn get_daemon_status_tracker(input: &[u8]) -> nom::IResult<&[u8], Str
             push_service,
             restricted,
         ),
-    ) = tuple((
-        le_f64,
-        le_u8,
-        le_u8,
-        le_u32,
-        le_u8,
-        take(RESERVED_SIZE),
-        le_u32,
-        le_i32,
-        le_u8,
-        le_u8,
-        le_u8,
-        le_u8,
-    ))(input)?;
+    ) = tup.parse(input)?;
 
+    let mut was_connected = false;
+    // When these unknown values are not 0 `was_connected` is always true
+    // Not 100% sure the significance or what they represent
+    if _unknown != 0 && _unknown2 != 0 && _unknown3 != 0 {
+        was_connected = true;
+    }
+
+    // Values found in dyldcache logd_location
     let reachability_str = match reachability {
+        0 => "kReachabilityUnavailable",
+        1 => "kReachabilitySmall",
         2 => "kReachabilityLarge",
+        1000 => "kReachabilityUnachievable",
         _ => {
-            warn!(
-                "[macos-unifiedlogs] Unknown reachability value: {}",
-                reachability
-            );
+            warn!("[macos-unifiedlogs] Unknown reachability value: {reachability}");
             "Unknown reachability value"
         }
     };
 
+    // Values found in dyldcache logd_location
+    // Other values seen are:
+    // kChargerTypeNone, kChargerTypeExternal, and kChargerTypeArcas.
+    // But have not observed the numerical value for these types
     let charger_type_str = match charger_type {
         0 => "kChargerTypeUnknown",
+        2 => "kChargerTypeUsb",
         _ => {
-            warn!(
-                "[macos-unifiedlogs] Unknown charger type value: {}",
-                charger_type
-            );
+            warn!("[macos-unifiedlogs] Unknown charger type value: {charger_type}");
             "Unknown charger type value"
         }
     };
 
     let message = format!(
-        r#"{{"thermalLevel": {}, "reachability: "{}", "airplaneMode": {}, "batteryData":{{"wasConnected": {}, "charged": {}, "level": {}, "connected": {}, "chargerType": "{}"}}, "restrictedMode": {}, "batterySaverModeEnabled": {}, "push_service":{}}}"#,
-        thermal_level,
-        reachability_str,
+        r#"{{"thermalLevel": {thermal_level}, "reachability": "{reachability_str}", "airplaneMode": {}, "batteryData":{{"wasConnected": {was_connected}, "charged": {}, "level": {level}, "connected": {}, "chargerType": "{charger_type_str}"}}, "restrictedMode": {}, "batterySaverModeEnabled": {}, "push_service":{}}}"#,
         lowercase_int_bool(airplane),
-        lowercase_int_bool(was_connected),
         lowercase_int_bool(charged),
-        level,
         lowercase_int_bool(connected),
-        charger_type_str,
         lowercase_int_bool(restricted),
         lowercase_int_bool(battery_saver),
         lowercase_int_bool(push_service)
@@ -559,7 +559,7 @@ mod tests {
         let test_data = "2";
         let result = subharvester_identifier(test_data).unwrap();
 
-        assert_eq!(result, "Tracks")
+        assert_eq!(result, "\"Wifi\"")
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
 
         assert_eq!(
             result,
-            "{\n            \"distanceFilter\":-1, \n            \"desiredAccuracy\":100, \n            \"updatingLocation\":false, \n            \"requestingLocation\":false, \n            \"requestingRanging\":false, \n            \"updatingRanging\":false,\n            \"updatingHeading\":false,\n            \"headingFilter\":1,\n            \"allowsLocationPrompts\":true,\n            \"allowsAlteredAccessoryLocations\":false,\n            \"dynamicAccuracyReductionEnabled\":false,\n            \"previousAuthorizationStatusValid\":false,\n            \"previousAuthorizationStatus\":0,\n            \"limitsPrecision\":false,\n            \"activityType\":0,\n            \"pausesLocationUpdatesAutomatically\":1,\n            \"paused\":false,\n            \"allowsBackgroundLocationUpdates\":false,\n            \"showsBackgroundLocationIndicator\":false,\n            \"allowsMapCorrection\":true,\n            \"batchingLocation\":false,\n            \"updatingVehicleSpeed\":false,\n            \"updatingVehicleHeading\":false,\n            \"matchInfoEnabled\":false,\n            \"groundAltitudeEnabled\":false,\n            \"fusionInfoEnabled\":false,\n            \"courtesyPromptNeeded\":false,\n            \"isAuthorizedForWidgetUpdates\":false,\n        }"       
+            "{\n            \"distanceFilter\":-1, \n            \"desiredAccuracy\":100, \n            \"updatingLocation\":false, \n            \"requestingLocation\":false, \n            \"requestingRanging\":false, \n            \"updatingRanging\":false,\n            \"updatingHeading\":false,\n            \"headingFilter\":1,\n            \"allowsLocationPrompts\":true,\n            \"allowsAlteredAccessoryLocations\":false,\n            \"dynamicAccuracyReductionEnabled\":false,\n            \"previousAuthorizationStatusValid\":false,\n            \"previousAuthorizationStatus\":0,\n            \"limitsPrecision\":false,\n            \"activityType\":0,\n            \"pausesLocationUpdatesAutomatically\":1,\n            \"paused\":false,\n            \"allowsBackgroundLocationUpdates\":false,\n            \"showsBackgroundLocationIndicator\":false,\n            \"allowsMapCorrection\":true,\n            \"batchingLocation\":false,\n            \"updatingVehicleSpeed\":false,\n            \"updatingVehicleHeading\":false,\n            \"matchInfoEnabled\":false,\n            \"groundAltitudeEnabled\":false,\n            \"fusionInfoEnabled\":false,\n            \"courtesyPromptNeeded\":false,\n            \"isAuthorizedForWidgetUpdates\":false,\n        }"
         )
     }
 
@@ -636,7 +636,7 @@ mod tests {
 
         assert_eq!(
             result,
-            "{\n            \"distanceFilter\":-1, \n            \"desiredAccuracy\":100, \n            \"updatingLocation\":false, \n            \"requestingLocation\":false, \n            \"requestingRanging\":false, \n            \"updatingRanging\":false,\n            \"updatingHeading\":false,\n            \"headingFilter\":1,\n            \"allowsLocationPrompts\":true,\n            \"allowsAlteredAccessoryLocations\":false,\n            \"dynamicAccuracyReductionEnabled\":false,\n            \"previousAuthorizationStatusValid\":false,\n            \"previousAuthorizationStatus\":0,\n            \"limitsPrecision\":false,\n            \"activityType\":0,\n            \"pausesLocationUpdatesAutomatically\":1,\n            \"paused\":false,\n            \"allowsBackgroundLocationUpdates\":false,\n            \"showsBackgroundLocationIndicator\":false,\n            \"allowsMapCorrection\":true,\n            \"batchingLocation\":false,\n            \"updatingVehicleSpeed\":false,\n            \"updatingVehicleHeading\":false,\n            \"matchInfoEnabled\":false,\n            \"groundAltitudeEnabled\":false,\n            \"fusionInfoEnabled\":false,\n            \"courtesyPromptNeeded\":false,\n            \"isAuthorizedForWidgetUpdates\":false,\n        }"       
+            "{\n            \"distanceFilter\":-1, \n            \"desiredAccuracy\":100, \n            \"updatingLocation\":false, \n            \"requestingLocation\":false, \n            \"requestingRanging\":false, \n            \"updatingRanging\":false,\n            \"updatingHeading\":false,\n            \"headingFilter\":1,\n            \"allowsLocationPrompts\":true,\n            \"allowsAlteredAccessoryLocations\":false,\n            \"dynamicAccuracyReductionEnabled\":false,\n            \"previousAuthorizationStatusValid\":false,\n            \"previousAuthorizationStatus\":0,\n            \"limitsPrecision\":false,\n            \"activityType\":0,\n            \"pausesLocationUpdatesAutomatically\":1,\n            \"paused\":false,\n            \"allowsBackgroundLocationUpdates\":false,\n            \"showsBackgroundLocationIndicator\":false,\n            \"allowsMapCorrection\":true,\n            \"batchingLocation\":false,\n            \"updatingVehicleSpeed\":false,\n            \"updatingVehicleHeading\":false,\n            \"matchInfoEnabled\":false,\n            \"groundAltitudeEnabled\":false,\n            \"fusionInfoEnabled\":false,\n            \"courtesyPromptNeeded\":false,\n            \"isAuthorizedForWidgetUpdates\":false,\n        }"
         )
     }
 
@@ -655,6 +655,23 @@ mod tests {
         ];
         let (_, result) = get_daemon_status_tracker(&test_data).unwrap();
 
-        assert_eq!(result, "{\"thermalLevel\": -1, \"reachability: \"kReachabilityLarge\", \"airplaneMode\": false, \"batteryData\":{\"wasConnected\": false, \"charged\": false, \"level\": -1, \"connected\": false, \"chargerType\": \"kChargerTypeUnknown\"}, \"restrictedMode\": false, \"batterySaverModeEnabled\": false, \"push_service\":false}")
+        assert_eq!(
+            result,
+            "{\"thermalLevel\": -1, \"reachability\": \"kReachabilityLarge\", \"airplaneMode\": false, \"batteryData\":{\"wasConnected\": false, \"charged\": false, \"level\": -1, \"connected\": false, \"chargerType\": \"kChargerTypeUnknown\"}, \"restrictedMode\": false, \"batterySaverModeEnabled\": false, \"push_service\":false}"
+        )
+    }
+
+    #[test]
+    fn test_get_daemon_status_tracker_was_connected_true() {
+        let test_data = [
+            0, 0, 0, 0, 0, 0, 89, 64, 0, 1, 19, 4, 2, 0, 0, 0, 1, 192, 243, 246, 5, 64, 0, 224, 2,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let (_, result) = get_daemon_status_tracker(&test_data).unwrap();
+
+        assert_eq!(
+            result,
+            "{\"thermalLevel\": 0, \"reachability\": \"kReachabilityLarge\", \"airplaneMode\": false, \"batteryData\":{\"wasConnected\": true, \"charged\": false, \"level\": 100, \"connected\": true, \"chargerType\": \"kChargerTypeUsb\"}, \"restrictedMode\": false, \"batterySaverModeEnabled\": false, \"push_service\":false}"
+        )
     }
 }

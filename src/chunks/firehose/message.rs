@@ -5,84 +5,197 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use log::{debug, info, warn};
+use crate::chunks::firehose::flags::FirehoseFormatters;
+use crate::traits::{FileProvider, StringCache};
+use crate::util::extract_string;
+use crate::uuidtext::UUIDTextEntry;
+use crate::{catalog::CatalogChunk, util::u64_to_usize};
+use log::{debug, error, info, warn};
 use nom::bytes::complete::take;
 
-use crate::catalog::CatalogChunk;
-use crate::dsc::SharedCacheStrings;
-use crate::util::extract_string;
-use crate::uuidtext::{UUIDText, UUIDTextEntry};
-
 #[derive(Debug, Default)]
-pub struct MessageData {
-    pub library: String,
-    pub format_string: String,
-    pub process: String,
-    pub library_uuid: String,
-    pub process_uuid: String,
+pub(crate) struct MessageData {
+    pub(crate) library: String,
+    pub(crate) format_string: String,
+    pub(crate) process: String,
+    pub(crate) library_uuid: String,
+    pub(crate) process_uuid: String,
+}
+
+pub(crate) struct MessageParams {
+    pub(crate) pc_id: u32,
+    pub(crate) string_offset: u64,
+    pub(crate) first_proc_id: u64,
+    pub(crate) second_proc_id: u32,
+    pub(crate) supports_large_offset: bool,
+}
+
+/// Convert a nom error carrying any input lifetime to one carrying `&'static [u8]`.
+///
+/// All internal `extract_*` functions return `nom::IResult<&'static [u8], _>` because their
+/// leftover bytes are always `&[]` — they never actually consume from a caller-supplied slice.
+/// Intermediate nom operations borrow from locally-held `Arc<T>` values whose lifetime cannot
+/// be expressed in the return type, so errors are remapped here to drop the input reference.
+fn nom_err_to_static<I>(
+    e: nom::Err<nom::error::Error<I>>,
+) -> nom::Err<nom::error::Error<&'static [u8]>> {
+    match e {
+        nom::Err::Error(ne) => nom::Err::Error(nom::error::Error::new(&[], ne.code)),
+        nom::Err::Failure(ne) => nom::Err::Failure(nom::error::Error::new(&[], ne.code)),
+        nom::Err::Incomplete(n) => nom::Err::Incomplete(n),
+    }
 }
 
 // Functions to help extract base format string based on flags associated with log entries
 // Ex: "%s start"
 impl MessageData {
-    /// Extract string from the Shared Strings Cache (dsc data)
-    //  Shared strings contain library and message string
-    pub fn extract_shared_strings<'a>(
-        shared_strings: &'a [SharedCacheStrings],
-        strings_data: &'a [UUIDText],
-        string_offset: u64,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+    /// Get the base message for the log
+    pub(crate) fn get_message(
+        formatters: &FirehoseFormatters,
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
+        params: &MessageParams,
         catalogs: &CatalogChunk,
-        original_offset: u64,
-    ) -> nom::IResult<&'a [u8], MessageData> {
-        debug!("[macos-unifiedlogs] Extracting format string from shared cache file (dsc)");
-        let mut message_data = MessageData::default();
+    ) -> nom::IResult<&'static [u8], MessageData> {
+        let string_offset = params.string_offset;
+        let pc_id = params.pc_id;
+        let shared_cache_string = formatters.shared_cache
+            || (formatters.large_shared_cache != 0)
+                && (!params.supports_large_offset || formatters.has_large_offset != 0);
 
-        // Check if the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0 {
-            for shared_string in shared_strings {
-                // Get shared string file (DSC) associated with log entry from Catalog
-                let (dsc_uuid, main_uuid) =
-                    MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
-                if shared_string.dsc_uuid != dsc_uuid {
-                    continue;
-                }
+        if shared_cache_string {
+            if formatters.has_large_offset != 0 {
+                let valid_large_offsets = [1, 2];
+                let large_offset = if valid_large_offsets.contains(&formatters.has_large_offset)
+                    && formatters.has_large_offset > formatters.large_shared_cache
+                {
+                    // Large offsets start at 0x80000000
+                    0x80000000 * u64::from(formatters.has_large_offset)
+                } else if formatters.large_shared_cache != 0 {
+                    // Large cache seems to always start at 0x100000000
+                    // But if large_shared_cache is 1 then the original `params.string_offset` is sufficient
+                    0x100000000 * u64::from(formatters.large_shared_cache / 2)
+                } else {
+                    // If large offset is not 1 or 2 then it could be invalid
+                    // However, not always guarantee
+                    // if has_large_offset is 0xfffe or 0xffff it may be invalid offset
+                    // Regardless, the starting offset always seems to be 0x100000000
+                    0x100000000 * u64::from(formatters.has_large_offset)
+                };
+                let real_offset = large_offset + string_offset;
 
-                if let Some(ranges) = shared_string.ranges.first() {
-                    shared_string.uuids[ranges.unknown_uuid_index as usize]
-                        .path_string
-                        .clone_into(&mut message_data.library);
-
-                    shared_string.uuids[ranges.unknown_uuid_index as usize]
-                        .uuid
-                        .clone_into(&mut message_data.library_uuid);
-                    message_data.format_string = String::from("%s");
-                    message_data.process_uuid = main_uuid;
-
-                    // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                    message_data.process = process_string;
-
-                    return Ok((&[], message_data));
-                }
+                return MessageData::extract_shared_strings(
+                    provider,
+                    cache,
+                    real_offset,
+                    params.first_proc_id,
+                    params.second_proc_id,
+                    catalogs,
+                    string_offset,
+                );
             }
+            return MessageData::extract_shared_strings(
+                provider,
+                cache,
+                string_offset,
+                params.first_proc_id,
+                params.second_proc_id,
+                catalogs,
+                string_offset,
+            );
         }
 
-        // Go through shared strings collections
-        for shared_string in shared_strings {
-            // Get shared string file (DSC) associated with log entry from Catalog
-            let (dsc_uuid, main_uuid) =
-                MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
-            if shared_string.dsc_uuid != dsc_uuid {
-                continue;
+        if formatters.absolute {
+            let offset =
+                (0x100000000 * u64::from(formatters.main_exe_alt_index)) + u64::from(pc_id);
+
+            return MessageData::extract_absolute_strings(
+                provider,
+                cache,
+                offset,
+                string_offset,
+                params.first_proc_id,
+                params.second_proc_id,
+                catalogs,
+                string_offset,
+            );
+        }
+        if !formatters.uuid_relative.is_empty() {
+            return MessageData::extract_alt_uuid_strings(
+                provider,
+                cache,
+                string_offset,
+                &formatters.uuid_relative,
+                params.first_proc_id,
+                params.second_proc_id,
+                catalogs,
+                string_offset,
+            );
+        }
+        MessageData::extract_format_strings(
+            provider,
+            cache,
+            string_offset,
+            params.first_proc_id,
+            params.second_proc_id,
+            catalogs,
+            string_offset,
+        )
+    }
+
+    /// Extract string from the Shared Strings Cache (dsc data)
+    /// Shared strings contain library and message string
+    pub(crate) fn extract_shared_strings(
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
+        string_offset: u64,
+        first_proc_id: u64,
+        second_proc_id: u32,
+        catalogs: &CatalogChunk,
+        original_offset: u64,
+    ) -> nom::IResult<&'static [u8], MessageData> {
+        debug!("[macos-unifiedlogs] Extracting format string from shared cache file (dsc)");
+        let mut message_data = MessageData::default();
+        // Get shared string file (DSC) associated with log entry from Catalog
+        let (dsc_uuid, main_uuid) =
+            MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
+
+        // Check if the string offset is "dynamic" (the formatter is "%s")
+        if original_offset & 0x80000000 != 0
+            && let Some(shared_string) = cache.get_or_load_dsc(&dsc_uuid, provider)
+            && let Some(ranges) = shared_string.ranges.first()
+        {
+            let uuid_index = ranges.uuid_index as usize;
+            let uuid_len = shared_string.uuids.len();
+            if uuid_index >= uuid_len {
+                warn!(
+                    "[macos-unifiedlogs] UUID index {uuid_index} out of bounds (max: {uuid_len}). Malformed data."
+                );
+                message_data.format_string = String::from("Error: Invalid UUID index");
+                return Ok((&[], message_data));
             }
 
-            debug!(
-                "[macos-unifiedlogs] Associated dsc file with log entry: {:?}",
-                dsc_uuid
-            );
+            shared_string.uuids[uuid_index]
+                .path_string
+                .clone_into(&mut message_data.library);
+
+            shared_string.uuids[uuid_index]
+                .uuid
+                .clone_into(&mut message_data.library_uuid);
+            message_data.format_string = String::from("%s");
+            message_data.process_uuid = main_uuid;
+
+            // Extract image path from second UUIDtext file
+            let (_, process_string) =
+                MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+            message_data.process = process_string;
+
+            return Ok((&[], message_data));
+        }
+
+        // Get shared strings collections
+        if let Some(shared_string) = cache.get_or_load_dsc(&dsc_uuid, provider) {
+            debug!("[macos-unifiedlogs] Associated dsc file with log entry: {dsc_uuid:?}");
 
             for ranges in &shared_string.ranges {
                 if string_offset >= ranges.range_offset
@@ -108,22 +221,47 @@ impl MessageData {
                         continue;
                     }
 
-                    let (message_start, _) = take(offset)(string_data)?;
-                    let (_, message_string) = extract_string(message_start)?;
+                    let offset = match u64_to_usize(offset) {
+                        Some(c) => c,
+                        None => {
+                            error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                            return Err(nom::Err::Error(nom::error::Error::new(
+                                &[],
+                                nom::error::ErrorKind::TooLarge,
+                            )));
+                        }
+                    };
+                    let (message_start, _) =
+                        take(offset)(string_data).map_err(nom_err_to_static)?;
+                    let (_, message_string) =
+                        extract_string(message_start).map_err(nom_err_to_static)?;
                     message_data.format_string = message_string;
 
-                    shared_string.uuids[ranges.unknown_uuid_index as usize]
+                    let uuid_index = ranges.uuid_index as usize;
+                    let uuid_len = shared_string.uuids.len();
+                    if uuid_index >= uuid_len {
+                        warn!(
+                            "[macos-unifiedlogs] UUID index {uuid_index} out of bounds (max: {uuid_len}). Malformed data."
+                        );
+                        message_data.format_string = String::from("Error: Invalid UUID index");
+                        return Ok((&[], message_data));
+                    }
+
+                    shared_string.uuids[uuid_index]
                         .path_string
                         .clone_into(&mut message_data.library);
 
-                    shared_string.uuids[ranges.unknown_uuid_index as usize]
+                    shared_string.uuids[uuid_index]
                         .uuid
                         .clone_into(&mut message_data.library_uuid);
                     message_data.process_uuid = main_uuid;
 
                     // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
+                    let (_, process_string) = MessageData::get_uuid_image_path(
+                        &message_data.process_uuid,
+                        provider,
+                        cache,
+                    )?;
                     message_data.process = process_string;
                     return Ok((&[], message_data));
                 }
@@ -132,21 +270,24 @@ impl MessageData {
 
         // There is a chance the log entry does not have a valid offset
         // Apple reports as "~~> <Invalid shared cache code pointer offset>" or <Invalid shared cache format string offset>
-        for shared_string in shared_strings {
-            // Get shared string file (DSC) associated with log entry from Catalog
-            let (dsc_uuid, main_uuid) =
-                MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
-            if shared_string.dsc_uuid != dsc_uuid {
-                continue;
-            }
-
+        if let Some(shared_string) = cache.get_or_load_dsc(&dsc_uuid, provider) {
             // Still get the image path/library for the log entry
             if let Some(ranges) = shared_string.ranges.first() {
-                shared_string.uuids[ranges.unknown_uuid_index as usize]
+                let uuid_index = ranges.uuid_index as usize;
+                let uuid_len = shared_string.uuids.len();
+                if uuid_index >= uuid_len {
+                    warn!(
+                        "[macos-unifiedlogs] UUID index {uuid_index} out of bounds (max: {uuid_len}). Malformed data."
+                    );
+                    message_data.format_string = String::from("Error: Invalid UUID index");
+                    return Ok((&[], message_data));
+                }
+
+                shared_string.uuids[uuid_index]
                     .path_string
                     .clone_into(&mut message_data.library);
 
-                shared_string.uuids[ranges.unknown_uuid_index as usize]
+                shared_string.uuids[uuid_index]
                     .uuid
                     .clone_into(&mut message_data.library_uuid);
                 message_data.format_string = String::from("Error: Invalid shared string offset");
@@ -154,7 +295,7 @@ impl MessageData {
 
                 // Extract image path from second UUIDtext file
                 let (_, process_string) =
-                    MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
+                    MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
                 message_data.process = process_string;
 
                 return Ok((&[], message_data));
@@ -169,14 +310,15 @@ impl MessageData {
 
     /// Extract strings from the `UUIDText` file associated with log entry
     /// `UUIDText` file contains process and message string
-    pub fn extract_format_strings<'a>(
-        strings_data: &'a [UUIDText],
+    pub(crate) fn extract_format_strings(
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
         string_offset: u64,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+        first_proc_id: u64,
+        second_proc_id: u32,
         catalogs: &CatalogChunk,
         original_offset: u64,
-    ) -> nom::IResult<&'a [u8], MessageData> {
+    ) -> nom::IResult<&'static [u8], MessageData> {
         debug!("[macos-unifiedlogs] Extracting format string from UUID file");
         let (_, main_uuid) = MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
 
@@ -188,83 +330,79 @@ impl MessageData {
         };
 
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0 {
-            for data in strings_data {
-                if message_data.process_uuid.ends_with(&data.uuid) {
-                    // Footer data is a collection of strings that ends with the image path/library associated with strings
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
+        if original_offset & 0x80000000 != 0
+            && let Some(data) = cache.get_or_load_uuidtext(&message_data.process_uuid, provider)
+        {
+            // Footer data is a collection of strings that ends with the image path/library associated with strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                    let (_, process_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                    process_string.clone_into(&mut message_data.process);
-                    message_data.library = process_string;
-                    message_data.format_string = String::from("%s");
+            let (_, process_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            process_string.clone_into(&mut message_data.process);
+            message_data.library = process_string;
+            message_data.format_string = String::from("%s");
 
-                    return Ok((&[], message_data));
-                }
-            }
+            return Ok((&[], message_data));
         }
 
-        // Go through the collection of parsed UUIDText files until matching UUID file is found
-        for data in strings_data {
-            if message_data.process_uuid.ends_with(&data.uuid) {
-                let mut string_start = 0;
-                for entry in &data.entry_descriptors {
-                    // Identify start of string formatter offset
-                    if entry.range_start_offset > string_offset as u32 {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-
-                    let offset = string_offset as u32 - entry.range_start_offset;
-                    // Footer data is a collection of strings that ends with the image path/library associated with strings
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
-
-                    // Check to make sure footer/string data is larger than the offset
-                    if (footer_data.len() < (offset + string_start) as usize)
-                        || offset > entry.entry_size
-                    {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-
-                    let (message_start, _) = take(offset + string_start)(footer_data)?;
-                    let (_, message_string) = extract_string(message_start)?;
-
-                    let (_, process_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-
-                    message_data.format_string = message_string;
-                    // Process and library path are the same for log entries with main_exe
-                    process_string.clone_into(&mut message_data.process);
-                    message_data.library = process_string;
-
-                    return Ok((&[], message_data));
+        // Get the collection of parsed UUIDText files until matching UUID file is found
+        if let Some(data) = cache.get_or_load_uuidtext(&message_data.process_uuid, provider) {
+            let mut string_start = 0;
+            for entry in &data.entry_descriptors {
+                // Identify start of string formatter offset
+                if entry.range_start_offset > string_offset as u32 {
+                    string_start += entry.entry_size;
+                    continue;
                 }
+
+                let offset = string_offset as u32 - entry.range_start_offset;
+                // Footer data is a collection of strings that ends with the image path/library associated with strings
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
+
+                // Check to make sure footer/string data is larger than the offset
+                if (footer_data.len() < (offset + string_start) as usize)
+                    || offset > entry.entry_size
+                {
+                    string_start += entry.entry_size;
+                    continue;
+                }
+
+                let (message_start, _) =
+                    take(offset + string_start)(footer_data).map_err(nom_err_to_static)?;
+                let (_, message_string) =
+                    extract_string(message_start).map_err(nom_err_to_static)?;
+
+                let (_, process_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+
+                message_data.format_string = message_string;
+                // Process and library path are the same for log entries with main_exe
+                process_string.clone_into(&mut message_data.process);
+                message_data.library = process_string;
+
+                return Ok((&[], message_data));
             }
         }
 
         // There is a chance the log entry does not have a valid offset
         // Apple labels as "error: ~~> Invalid bounds 4334340 for E502E11E-518F-38A7-9F0B-E129168338E7"
-        for data in strings_data {
-            if message_data.process_uuid.ends_with(&data.uuid) {
-                // Footer data is a collection of strings that ends with the image process associated with the strings
-                let strings = &data.footer_data;
-                let footer_data: &[u8] = strings;
+        if let Some(data) = cache.get_or_load_uuidtext(&message_data.process_uuid, provider) {
+            // Footer data is a collection of strings that ends with the image process associated with the strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                let (_, process_string) =
-                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                process_string.clone_into(&mut message_data.process);
-                message_data.library = process_string;
-                message_data.format_string = format!(
-                    "Error: Invalid offset {} for UUID {}",
-                    string_offset, message_data.process_uuid
-                );
+            let (_, process_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            process_string.clone_into(&mut message_data.process);
+            message_data.library = process_string;
+            message_data.format_string = format!(
+                "Error: Invalid offset {string_offset} for UUID {}",
+                message_data.process_uuid
+            );
 
-                return Ok((&[], message_data));
-            }
+            return Ok((&[], message_data));
         }
 
         warn!(
@@ -280,42 +418,41 @@ impl MessageData {
 
     /// Extract strings from the `UUIDText` file associated with log entry that have `absolute` flag set
     /// `UUIDText` file contains process and message string
-    pub fn extract_absolute_strings<'a>(
-        strings_data: &'a [UUIDText],
+    fn extract_absolute_strings(
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
         absolute_offset: u64,
         string_offset: u64,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+        first_proc_id: u64,
+        second_proc_id: u32,
         catalogs: &CatalogChunk,
         original_offset: u64,
-    ) -> nom::IResult<&'a [u8], MessageData> {
-        debug!("[macos-unifiedlogs] Extracting format string from UUID file for log entry with Absolute flag");
+    ) -> nom::IResult<&'static [u8], MessageData> {
+        debug!(
+            "[macos-unifiedlogs] Extracting format string from UUID file for log entry with Absolute flag"
+        );
         let mut uuid = String::new();
-        // Go through Catalog associated with log entry and find UUID entry associated with log message (first_proc_id@second_proc_id)
-        for process_info in &catalogs.catalog_process_info_entries {
-            if first_proc_id == &process_info.first_number_proc_id
-                && second_proc_id == &process_info.second_number_proc_id
-            {
-                // In addition to first_proc_id and second_proc_id, we need to go through UUID entries in the catalog
-                // Entries with the Absolute flag have the UUID stored in an Vec of UUIDs and offsets/load_address
-                // The correct UUID entry is the one where the absolute_offset value falls in between load_address and load_address size (uuids.load_address + uuids.size)
-                for uuids in &process_info.uuid_info_entries {
-                    if absolute_offset >= uuids.load_address
-                        && absolute_offset <= (uuids.load_address + u64::from(uuids.size))
-                    {
-                        debug!(
-                            "[macos-unifiedlogs] Absolute uuid file is: {:?}",
-                            uuids.uuid
-                        );
-                        uuids.uuid.clone_into(&mut uuid);
-                        break;
-                    }
+        if let Some(entry) = catalogs
+            .catalog_process_info_entries
+            .get(&format!("{first_proc_id}_{second_proc_id}"))
+        {
+            // In addition to first_proc_id and second_proc_id, we need to go through UUID entries in the catalog
+            // Entries with the Absolute flag have the UUID stored in an Vec of UUIDs and offsets/load_address
+            // The correct UUID entry is the one where the absolute_offset value falls in between load_address and load_address size (uuids.load_address + uuids.size)
+            for uuids in &entry.uuid_info_entries {
+                if absolute_offset >= uuids.load_address
+                    && absolute_offset <= (uuids.load_address + u64::from(uuids.size))
+                {
+                    debug!(
+                        "[macos-unifiedlogs] Absolute uuid file is: {:?}",
+                        uuids.uuid
+                    );
+                    uuids.uuid.clone_into(&mut uuid);
+                    break;
                 }
             }
-            if !uuid.is_empty() {
-                break;
-            }
         }
+
         // The UUID for log entries with absolute flag dont use the dsc uuid files
         let (_, main_uuid) = MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
 
@@ -326,93 +463,111 @@ impl MessageData {
             library_uuid: uuid,
             process_uuid: main_uuid,
         };
+
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if (original_offset & 0x80000000 != 0) || string_offset == absolute_offset {
-            for data in strings_data {
-                if message_data.library_uuid.ends_with(&data.uuid) {
-                    // Footer data is a collection of strings that ends with the image path/library associated with strings
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
+        if ((original_offset & 0x80000000 != 0) || string_offset == absolute_offset)
+            && let Some(data) = cache.get_or_load_uuidtext(&message_data.library_uuid, provider)
+        {
+            // Footer data is a collection of strings that ends with the image path/library associated with strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                    // Extract image path from current UUIDtext file
-                    let (_, library_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                    message_data.library = library_string;
+            // Extract image path from current UUIDtext file
+            let (_, library_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            message_data.library = library_string;
 
-                    // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                    message_data.process = process_string;
-                    message_data.format_string = String::from("%s");
+            // Extract image path from second UUIDtext file
+            let (_, process_string) =
+                MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+            message_data.process = process_string;
+            message_data.format_string = String::from("%s");
 
-                    return Ok((&[], message_data));
-                }
-            }
+            return Ok((&[], message_data));
         }
 
-        for data in strings_data {
-            if message_data.library_uuid.ends_with(&data.uuid) {
-                let mut string_start = 0;
-                for entry in &data.entry_descriptors {
-                    // Identify start of string formatter offset
-                    if u64::from(entry.range_start_offset) > string_offset {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
-
-                    let offset = string_offset - u64::from(entry.range_start_offset);
-                    // Check to make sure footer/string data is larger than the offset
-                    if (footer_data.len() < (offset + u64::from(string_start)) as usize)
-                        || offset > u64::from(entry.entry_size)
-                    {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-                    let (message_start, _) = take(offset + u64::from(string_start))(footer_data)?;
-                    let (_, message_string) = extract_string(message_start)?;
-
-                    // Extract image path from current UUIDtext file
-                    let (_, library_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                    message_data.format_string = message_string;
-                    message_data.library = library_string;
-
-                    // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                    message_data.process = process_string;
-                    return Ok((&[], message_data));
+        if let Some(data) = cache.get_or_load_uuidtext(&message_data.library_uuid, provider) {
+            let mut string_start = 0;
+            for entry in &data.entry_descriptors {
+                // Identify start of string formatter offset
+                if u64::from(entry.range_start_offset) > string_offset {
+                    string_start += entry.entry_size;
+                    continue;
                 }
+
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
+
+                let offset = string_offset - u64::from(entry.range_start_offset);
+                // Check to make sure footer/string data is larger than the offset
+                if (footer_data.len() < (offset + u64::from(string_start)) as usize)
+                    || offset > u64::from(entry.entry_size)
+                {
+                    string_start += entry.entry_size;
+                    continue;
+                }
+
+                let offset = match u64_to_usize(offset) {
+                    Some(o) => o,
+                    None => {
+                        error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            &[],
+                            nom::error::ErrorKind::TooLarge,
+                        )));
+                    }
+                };
+                let string_start = match usize::try_from(string_start) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        error!("[macos-unifiedlogs] u64 is bigger than system usize");
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            &[],
+                            nom::error::ErrorKind::TooLarge,
+                        )));
+                    }
+                };
+                let (message_start, _) =
+                    take(offset + string_start)(footer_data).map_err(nom_err_to_static)?;
+                let (_, message_string) =
+                    extract_string(message_start).map_err(nom_err_to_static)?;
+
+                // Extract image path from current UUIDtext file
+                let (_, library_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+                message_data.format_string = message_string;
+                message_data.library = library_string;
+
+                // Extract image path from second UUIDtext file
+                let (_, process_string) =
+                    MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+                message_data.process = process_string;
+                return Ok((&[], message_data));
             }
         }
 
         // There is a chance the log entry does not have a valid offset
         // Apple labels as "error: ~~> Invalid bounds 4334340 for E502E11E-518F-38A7-9F0B-E129168338E7"
-        for data in strings_data {
-            if message_data.library_uuid.ends_with(&data.uuid) {
-                // Footer data is a collection of strings that ends with the image process associated with the strings
-                let strings = &data.footer_data;
-                let footer_data: &[u8] = strings;
+        if let Some(data) = cache.get_or_load_uuidtext(&message_data.library_uuid, provider) {
+            // Footer data is a collection of strings that ends with the image process associated with the strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                // Extract image path from current UUIDtext file
-                let (_, library_string) =
-                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                message_data.library = library_string;
-                message_data.format_string = format!(
-                    "Error: Invalid offset {} for absolute UUID {}",
-                    string_offset, message_data.library_uuid
-                );
+            // Extract image path from current UUIDtext file
+            let (_, library_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            message_data.library = library_string;
+            message_data.format_string = format!(
+                "Error: Invalid offset {string_offset} for absolute UUID {}",
+                message_data.library_uuid
+            );
 
-                // Extract image path from second UUIDtext file
-                let (_, process_string) =
-                    MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                message_data.process = process_string;
+            // Extract image path from second UUIDtext file
+            let (_, process_string) =
+                MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+            message_data.process = process_string;
 
-                return Ok((&[], message_data));
-            }
+            return Ok((&[], message_data));
         }
 
         warn!(
@@ -428,15 +583,16 @@ impl MessageData {
 
     /// Extract strings from an alt `UUIDText` file specified within the log entry that have `uuid_relative` flag set
     /// `UUIDText` files contains library and process and message string
-    pub fn extract_alt_uuid_strings<'a>(
-        strings_data: &'a [UUIDText],
+    fn extract_alt_uuid_strings(
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
         string_offset: u64,
         uuid: &str,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+        first_proc_id: u64,
+        second_proc_id: u32,
         catalogs: &CatalogChunk,
         original_offset: u64,
-    ) -> nom::IResult<&'a [u8], MessageData> {
+    ) -> nom::IResult<&'static [u8], MessageData> {
         debug!("[macos-unifiedlogs] Extracting format string from alt uuid");
         // Log entries with uuid_relative flags set have the UUID in the log itself. They do not use the dsc UUID files
         let (_, main_uuid) = MessageData::get_catalog_dsc(catalogs, first_proc_id, second_proc_id);
@@ -448,169 +604,154 @@ impl MessageData {
             library_uuid: uuid.to_string(),
             process_uuid: main_uuid,
         };
+
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0 {
-            for data in strings_data {
-                if uuid.ends_with(&data.uuid) {
-                    // Footer data is a collection of strings that ends with the image path/library associated with strings
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
+        if original_offset & 0x80000000 != 0
+            && let Some(data) = cache.get_or_load_uuidtext(uuid, provider)
+        {
+            // Footer data is a collection of strings that ends with the image path/library associated with strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                    // Extract image path from current UUIDtext file
-                    let (_, library_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                    message_data.library = library_string;
+            // Extract image path from current UUIDtext file
+            let (_, library_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            message_data.library = library_string;
 
-                    // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                    message_data.process = process_string;
-                    message_data.format_string = String::from("%s");
+            // Extract image path from second UUIDtext file
+            let (_, process_string) =
+                MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+            message_data.process = process_string;
+            message_data.format_string = String::from("%s");
 
-                    return Ok((&[], message_data));
-                }
-            }
+            return Ok((&[], message_data));
         }
 
-        for data in strings_data {
-            if uuid.ends_with(&data.uuid) {
-                let mut string_start = 0;
-                for entry in &data.entry_descriptors {
-                    // Identify start of string formatter offset
-                    if entry.range_start_offset > string_offset as u32 {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-                    let offset = string_offset as u32 - entry.range_start_offset;
-                    let strings = &data.footer_data;
-                    let footer_data: &[u8] = strings;
-
-                    // Check to make sure footer/string data is larger than the offset
-                    // Or if the offset is greater than the entry size
-                    // If offset greater than entry size then its not the correct UUIDText entry
-                    if (footer_data.len() < offset as usize) || offset > entry.entry_size {
-                        string_start += entry.entry_size;
-                        continue;
-                    }
-                    let (message_start, _) = take(offset + string_start)(footer_data)?;
-                    let (_, message_string) = extract_string(message_start)?;
-
-                    // Extract image path from current UUIDtext file
-                    let (_, library_string) =
-                        MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-
-                    // Extract image path from second UUIDtext file
-                    let (_, process_string) =
-                        MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                    message_data.process = process_string;
-
-                    message_data.format_string = message_string;
-                    message_data.library = library_string;
-                    return Ok((&[], message_data));
+        if let Some(data) = cache.get_or_load_uuidtext(uuid, provider) {
+            let mut string_start = 0;
+            for entry in &data.entry_descriptors {
+                // Identify start of string formatter offset
+                if u64::from(entry.range_start_offset) > string_offset {
+                    string_start += entry.entry_size;
+                    continue;
                 }
+                let offset = string_offset - u64::from(entry.range_start_offset);
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
+
+                // Check to make sure footer/string data is larger than the offset
+                // Or if the offset is greater than the entry size
+                // If offset greater than entry size then its not the correct UUIDText entry
+                if ((footer_data.len() as u64) < offset) || offset > u64::from(entry.entry_size) {
+                    string_start += entry.entry_size;
+                    continue;
+                }
+                let (message_start, _) = take(offset + u64::from(string_start))(footer_data)
+                    .map_err(nom_err_to_static)?;
+                let (_, message_string) =
+                    extract_string(message_start).map_err(nom_err_to_static)?;
+
+                // Extract image path from current UUIDtext file
+                let (_, library_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+
+                // Extract image path from second UUIDtext file
+                let (_, process_string) =
+                    MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+                message_data.process = process_string;
+
+                message_data.format_string = message_string;
+                message_data.library = library_string;
+                return Ok((&[], message_data));
             }
         }
 
         // There is a chance the log entry does not have a valid offset
         // Apple labels as "error: ~~> Invalid bounds 4334340 for E502E11E-518F-38A7-9F0B-E129168338E7"
-        for data in strings_data {
-            if uuid.ends_with(&data.uuid) {
-                // Footer data is a collection of strings that ends with the image process associated with the strings
-                let strings = &data.footer_data;
-                let footer_data: &[u8] = strings;
+        if let Some(data) = cache.get_or_load_uuidtext(uuid, provider) {
+            // Footer data is a collection of strings that ends with the image process associated with the strings
+            let strings = &data.footer_data;
+            let footer_data: &[u8] = strings;
 
-                // Extract image path from current UUIDtext file
-                let (_, library_string) =
-                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-                message_data.library = library_string;
-                message_data.format_string = format!(
-                    "Error: Invalid offset {} for alternative UUID {}",
-                    string_offset, uuid
-                );
+            // Extract image path from current UUIDtext file
+            let (_, library_string) =
+                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+            message_data.library = library_string;
+            message_data.format_string =
+                format!("Error: Invalid offset {string_offset} for alternative UUID {uuid}");
 
-                // Extract image path from second UUIDtext file
-                let (_, process_string) =
-                    MessageData::get_uuid_image_path(&message_data.process_uuid, strings_data)?;
-                message_data.process = process_string;
+            // Extract image path from second UUIDtext file
+            let (_, process_string) =
+                MessageData::get_uuid_image_path(&message_data.process_uuid, provider, cache)?;
+            message_data.process = process_string;
 
-                return Ok((&[], message_data));
-            }
+            return Ok((&[], message_data));
         }
 
         warn!(
-            "[macos-unifiedlogs] Failed to get message string from alternative UUIDText file: {}",
-            uuid
+            "[macos-unifiedlogs] Failed to get message string from alternative UUIDText file: {uuid}"
         );
-        message_data.format_string = format!(
-            "Failed to get string message from alternative UUIDText file: {}",
-            uuid
-        );
+        message_data.format_string =
+            format!("Failed to get string message from alternative UUIDText file: {uuid}");
         Ok((&[], message_data))
     }
 
     /// Get the image path at the end of the `UUIDText` file
-    fn uuidtext_image_path<'a>(
-        data: &'a [u8],
+    fn uuidtext_image_path(
+        data: &[u8],
         entries: &[UUIDTextEntry],
-    ) -> nom::IResult<&'a [u8], String> {
+    ) -> nom::IResult<&'static [u8], String> {
         // Add up all entry range offset sizes to get image library offset
-        let mut image_library_offest: u32 = 0;
+        let mut image_library_offset: u32 = 0;
         for entry in entries {
-            image_library_offest += entry.entry_size;
+            image_library_offset += entry.entry_size;
         }
-        let (library_start, _) = take(image_library_offest)(data)?;
-        extract_string(library_start)
+        let (library_start, _) = take(image_library_offset)(data).map_err(nom_err_to_static)?;
+        let (_, result) = extract_string(library_start).map_err(nom_err_to_static)?;
+        Ok((&[], result))
     }
 
     /// Get the image path from provided `main_uuid` entry
-    fn get_uuid_image_path<'a>(
+    fn get_uuid_image_path(
         main_uuid: &str,
-        entries: &'a [UUIDText],
-    ) -> nom::IResult<&'a [u8], String> {
-        for data in entries {
-            if main_uuid.ends_with(&data.uuid) {
-                return MessageData::uuidtext_image_path(
-                    &data.footer_data,
-                    &data.entry_descriptors,
-                );
-            }
-        }
+        provider: &impl FileProvider,
+        cache: &impl StringCache,
+    ) -> nom::IResult<&'static [u8], String> {
         // An UUID of all zeros is possilbe in the Catalog, if this happens there is no process path
         if main_uuid == "00000000000000000000000000000000" {
             info!("[macos-unifiedlogs] Got UUID of all zeros fom Catalog");
             return Ok((&[], String::new()));
         }
+
+        if let Some(data) = cache.get_or_load_uuidtext(main_uuid, provider) {
+            return MessageData::uuidtext_image_path(&data.footer_data, &data.entry_descriptors);
+        }
+
         warn!(
-            "[macos-unifiedlogs] Failed to get path string from UUIDText file for entry: {}",
-            main_uuid
+            "[macos-unifiedlogs] Failed to get path string from UUIDText file for entry: {main_uuid}"
         );
 
         Ok((
             &[],
-            format!(
-                "Failed to get path string from UUIDText file for entry: {}",
-                main_uuid
-            ),
+            format!("Failed to get path string from UUIDText file for entry: {main_uuid}"),
         ))
     }
 
     // Grab dsc file name from the Catalog data based on first and second proc ids from the Firehose log
     fn get_catalog_dsc(
         catalogs: &CatalogChunk,
-        first_proc_id: &u64,
-        second_proc_id: &u32,
+        first_proc_id: u64,
+        second_proc_id: u32,
     ) -> (String, String) {
         let mut dsc_uuid = String::new();
         let mut main_uuid = String::new();
 
-        for process_info in &catalogs.catalog_process_info_entries {
-            if first_proc_id == &process_info.first_number_proc_id
-                && second_proc_id == &process_info.second_number_proc_id
-            {
-                process_info.dsc_uuid.clone_into(&mut dsc_uuid);
-                process_info.main_uuid.clone_into(&mut main_uuid);
-                break;
-            }
+        if let Some(entry) = catalogs
+            .catalog_process_info_entries
+            .get(&format!("{first_proc_id}_{second_proc_id}"))
+        {
+            entry.dsc_uuid.clone_into(&mut dsc_uuid);
+            entry.main_uuid.clone_into(&mut main_uuid);
         }
         (dsc_uuid, main_uuid)
     }
@@ -618,39 +759,33 @@ impl MessageData {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use crate::{
-        chunks::firehose::message::MessageData,
-        filesystem::LogarchiveProvider,
-        parser::{collect_shared_strings, collect_strings, parse_log},
+        cache::MemoryStringCache, chunks::firehose::message::MessageData,
+        filesystem::LogarchiveProvider, parser::parse_log,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn test_extract_shared_strings_nonactivity() {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
-
-        test_path.push("dsc");
-        let shared_strings_results = collect_shared_strings(&provider).unwrap();
-        test_path.pop();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 1331408102;
         let test_first_proc_id = 45;
         let test_second_proc_id = 188;
 
         let (_, results) = MessageData::extract_shared_strings(
-            &shared_strings_results,
-            &strings,
+            &provider,
+            &cache,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -672,26 +807,22 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
-
-        test_path.push("dsc");
-        let shared_strings_results = collect_shared_strings(&provider).unwrap();
-        test_path.pop();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let bad_offset = 7;
         let test_first_proc_id = 45;
         let test_second_proc_id = 188;
 
         let (_, results) = MessageData::extract_shared_strings(
-            &shared_strings_results,
-            &strings,
+            &provider,
+            &cache,
             bad_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -710,23 +841,21 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
-
-        let shared_strings_results = collect_shared_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 2420246585;
         let test_first_proc_id = 32;
         let test_second_proc_id = 424;
         let (_, results) = MessageData::extract_shared_strings(
-            &shared_strings_results,
-            &strings,
+            &provider,
+            &cache,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[2].catalog,
             test_offset,
         )
@@ -749,20 +878,21 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 14960;
         let test_first_proc_id = 45;
         let test_second_proc_id = 188;
         let (_, results) = MessageData::extract_format_strings(
-            &strings,
+            &provider,
+            &cache,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             test_offset,
         )
@@ -783,20 +913,20 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
-
+        let cache = MemoryStringCache::default();
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let bad_offset = 1;
         let test_first_proc_id = 45;
         let test_second_proc_id = 188;
         let (_, results) = MessageData::extract_format_strings(
-            &strings,
+            &provider,
+            &cache,
             bad_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -815,29 +945,36 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 2147519968;
         let test_first_proc_id = 38;
         let test_second_proc_id = 317;
         let (_, results) = MessageData::extract_format_strings(
-            &strings,
+            &provider,
+            &cache,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[4].catalog,
             test_offset,
         )
         .unwrap();
 
-        assert_eq!(results.process, "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool");
+        assert_eq!(
+            results.process,
+            "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool"
+        );
         assert_eq!(results.process_uuid, "6F2A273A77993A719F649607CADC090B");
 
-        assert_eq!(results.library, "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool");
+        assert_eq!(
+            results.library,
+            "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool"
+        );
         assert_eq!(results.library_uuid, "6F2A273A77993A719F649607CADC090B");
 
         assert_eq!(results.format_string, "%s")
@@ -849,26 +986,30 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let bad_offset = 55;
         let test_first_proc_id = 38;
         let test_second_proc_id = 317;
         let (_, results) = MessageData::extract_format_strings(
-            &strings,
+            &provider,
+            &cache,
             bad_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[4].catalog,
             bad_offset,
         )
         .unwrap();
 
-        assert_eq!(results.process, "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool");
+        assert_eq!(
+            results.process,
+            "/System/Library/PrivateFrameworks/SystemAdministration.framework/Versions/A/Resources/UpdateSettingsTool"
+        );
         assert_eq!(
             results.format_string,
             "Error: Invalid offset 55 for UUID 6F2A273A77993A719F649607CADC090B"
@@ -881,23 +1022,24 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
 
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 396912;
         let test_absolute_offset = 280925241119206;
         let test_first_proc_id = 0;
         let test_second_proc_id = 0;
         let (_, results) = MessageData::extract_absolute_strings(
-            &strings,
+            &provider,
+            &cache,
             test_absolute_offset,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -915,22 +1057,23 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 396912;
         let bad_offset = 12;
         let test_first_proc_id = 0;
         let test_second_proc_id = 0;
         let (_, results) = MessageData::extract_absolute_strings(
-            &strings,
+            &provider,
+            &cache,
             bad_offset,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -948,11 +1091,11 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_offset = 102;
         let test_absolute_offset = 102;
@@ -961,11 +1104,12 @@ mod tests {
         let test_first_proc_id = 0;
         let test_second_proc_id = 0;
         let (_, results) = MessageData::extract_absolute_strings(
-            &strings,
+            &provider,
+            &cache,
             test_absolute_offset,
             test_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[1].catalog,
             test_offset,
         )
@@ -984,11 +1128,11 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let bad_offset = 111;
         let test_absolute_offset = 102;
@@ -997,11 +1141,12 @@ mod tests {
         let test_first_proc_id = 0;
         let test_second_proc_id = 0;
         let (_, results) = MessageData::extract_absolute_strings(
-            &strings,
+            &provider,
+            &cache,
             test_absolute_offset,
             bad_offset,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
             &log_data.catalog_data[1].catalog,
             bad_offset,
         )
@@ -1023,11 +1168,11 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         test_path.push("Persist/0000000000000005.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let first_proc_id = 105;
         let second_proc_id = 240;
@@ -1035,11 +1180,12 @@ mod tests {
         let test_offset = 221408;
         let test_uuid = "C275D5EEBAD43A86B74F16F3E62BF57D";
         let (_, results) = MessageData::extract_alt_uuid_strings(
-            &strings,
+            &provider,
+            &cache,
             test_offset,
             test_uuid,
-            &first_proc_id,
-            &second_proc_id,
+            first_proc_id,
+            second_proc_id,
             &log_data.catalog_data[0].catalog,
             0,
         )
@@ -1060,15 +1206,15 @@ mod tests {
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
         test_path.push("Persist/0000000000000002.tracev3");
-        let handle = std::fs::File::open(test_path).unwrap();
-        let log_data = parse_log(handle).unwrap();
+        let handle = std::fs::File::open(&test_path).unwrap();
+        let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
         let test_first_proc_id = 136;
         let test_second_proc_id = 342;
         let (dsc_uuid, main_uuid) = MessageData::get_catalog_dsc(
             &log_data.catalog_data[0].catalog,
-            &test_first_proc_id,
-            &test_second_proc_id,
+            test_first_proc_id,
+            test_second_proc_id,
         );
 
         assert_eq!(dsc_uuid, "80896B329EB13A10A7C5449B15305DE2");
@@ -1080,11 +1226,11 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
         let provider = LogarchiveProvider::new(test_path.as_path());
-        let strings = collect_strings(&provider).unwrap();
+        let cache = MemoryStringCache::default();
 
         let test_uuid = "B736DF1625F538248E9527A8CEC4991E";
-
-        let (_, image_path) = MessageData::get_uuid_image_path(test_uuid, &strings).unwrap();
+        let (_, image_path) =
+            MessageData::get_uuid_image_path(test_uuid, &provider, &cache).unwrap();
 
         assert_eq!(image_path, "/usr/libexec/opendirectoryd");
     }
