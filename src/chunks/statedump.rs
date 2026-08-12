@@ -5,13 +5,12 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use crate::decoders::location;
-use crate::util::{clean_uuid, encode_standard, extract_string};
+use crate::decoders::{config, location};
+use crate::util::{encode_standard, extract_string};
 use log::{error, info};
 use nom::bytes::complete::take;
-use nom::number::complete::{le_u32, le_u64, le_u8};
+use nom::number::complete::{be_u128, le_u8, le_u32, le_u64};
 use plist::Value;
-use std::mem::size_of;
 
 #[derive(Debug, Clone, Default)]
 pub struct Statedump {
@@ -38,33 +37,22 @@ impl Statedump {
     pub fn parse_statedump(data: &[u8]) -> nom::IResult<&[u8], Statedump> {
         let mut statedump_results = Statedump::default();
 
-        let (input, chunk_tag) = take(size_of::<u32>())(data)?;
-        let (input, chunk_sub_tag) = take(size_of::<u32>())(input)?;
-        let (input, chunk_data_size) = take(size_of::<u64>())(input)?;
-        let (input, first_number_proc_id) = take(size_of::<u64>())(input)?;
-        let (input, second_number_proc_id) = take(size_of::<u32>())(input)?;
+        let (input, statedump_chunk_tag) = le_u32(data)?;
+        let (input, statedump_chunk_sub_tag) = le_u32(input)?;
+        let (input, statedump_chunk_data_size) = le_u64(input)?;
+        let (input, statedump_first_proc_id) = le_u64(input)?;
+        let (input, statedump_second_proc_id) = le_u32(input)?;
+        let (input, statedump_ttl) = le_u8(input)?;
 
-        let (input, ttl) = take(size_of::<u8>())(input)?;
-        let unknown_reserved_size: u8 = 3;
-        let (input, unknown_reserved) = take(unknown_reserved_size)(input)?;
-        let (input, continuous_time) = take(size_of::<u64>())(input)?;
-        let (input, activity_id) = take(size_of::<u64>())(input)?;
-        let (input, uuid) = take(size_of::<u128>())(input)?;
-        let (input, unknown_data_type) = take(size_of::<u32>())(input)?;
+        let reserved_size: u8 = 3;
+        let (input, reserved) = take(reserved_size)(input)?;
 
-        let (_, statedump_chunk_tag) = le_u32(chunk_tag)?;
-        let (_, statedump_chunk_sub_tag) = le_u32(chunk_sub_tag)?;
-        let (_, statedump_chunk_data_size) = le_u64(chunk_data_size)?;
-        let (_, statedump_first_proc_id) = le_u64(first_number_proc_id)?;
-        let (_, statedump_second_proc_id) = le_u32(second_number_proc_id)?;
+        let (input, statedump_continous_time) = le_u64(input)?;
+        let (input, statedump_activity_id) = le_u64(input)?;
+        let (input, uuid) = be_u128(input)?;
+        let (input, statedump_unknown_data_type) = le_u32(input)?;
 
-        let (_, statedump_ttl) = le_u8(ttl)?;
-        let (_, statedump_continous_time) = le_u64(continuous_time)?;
-        let (_, statedump_activity_id) = le_u64(activity_id)?;
-        let (_, statedump_unknown_data_type) = le_u32(unknown_data_type)?;
-
-        let (mut input, unknown_data_size) = take(size_of::<u32>())(input)?;
-        let (_, statedump_unknown_data_size) = le_u32(unknown_data_size)?;
+        let (mut input, statedump_unknown_data_size) = le_u32(input)?;
 
         let custom_decoder = 3;
         let string_size: u8 = 64;
@@ -98,14 +86,13 @@ impl Statedump {
         statedump_results.first_proc_id = statedump_first_proc_id;
         statedump_results.second_proc_id = statedump_second_proc_id;
         statedump_results.ttl = statedump_ttl;
-        statedump_results.unknown_reserved = unknown_reserved.to_vec();
+        statedump_results.unknown_reserved = reserved.to_vec();
         statedump_results.continuous_time = statedump_continous_time;
         statedump_results.activity_id = statedump_activity_id;
         statedump_results.unknown_data_type = statedump_unknown_data_type;
         statedump_results.unknown_data_size = statedump_unknown_data_size;
 
-        let uuid_string = format!("{:02X?}", uuid);
-        statedump_results.uuid = clean_uuid(&uuid_string);
+        statedump_results.uuid = format!("{uuid:032X}");
 
         let (input, statedump_data) = take(statedump_unknown_data_size)(input)?;
         statedump_results.statedump_data = statedump_data.to_vec();
@@ -126,19 +113,13 @@ impl Statedump {
                 match json_data {
                     Ok(json) => json,
                     Err(err) => {
-                        error!(
-                            "[macos-unifiedlogs] Failed to convert plist to json: {:?}",
-                            err
-                        );
+                        error!("[macos-unifiedlogs] Failed to convert plist to json: {err:?}");
                         String::from("Failed to convert plist data to json")
                     }
                 }
             }
             Err(err) => {
-                error!(
-                    "[macos-unifiedlogs] Failed to parse statedump plist data: {:?}",
-                    err
-                );
+                error!("[macos-unifiedlogs] Failed to parse statedump plist data: {err:?}");
                 String::from("Failed to get plist data")
             }
         }
@@ -150,6 +131,8 @@ impl Statedump {
             "CLDaemonStatusStateTracker" => location::get_daemon_status_tracker(object_data),
             "CLClientManagerStateTracker" => location::get_state_tracker_data(object_data),
             "CLLocationManagerStateTracker" => location::get_location_tracker_state(object_data),
+            "DNS Configuration" => config::get_dns_config(object_data),
+            "Network information" => config::get_network_interface(object_data),
             _ => {
                 return format!(
                     "Unsupported Statedump object: {name}-{}",
@@ -160,11 +143,8 @@ impl Statedump {
         match message_result {
             Ok((_, result)) => result,
             Err(err) => {
-                error!(
-                    "[macos-unifiedlogs] Failed to parse statedump object {}: {:?}",
-                    name, err
-                );
-                format!("Failed to parse statedump object: {}", name)
+                error!("[macos-unifiedlogs] Failed to parse statedump object {name}: {err:?}");
+                format!("Failed to parse statedump object: {name}")
             }
         }
     }
@@ -1061,6 +1041,9 @@ mod tests {
             255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         let result = Statedump::parse_statedump_object(&test_data, name);
-        assert_eq!(result, "{\"thermalLevel\": -1, \"reachability: \"kReachabilityLarge\", \"airplaneMode\": false, \"batteryData\":{\"wasConnected\": false, \"charged\": false, \"level\": -1, \"connected\": false, \"chargerType\": \"kChargerTypeUnknown\"}, \"restrictedMode\": false, \"batterySaverModeEnabled\": false, \"push_service\":false}");
+        assert_eq!(
+            result,
+            "{\"thermalLevel\": -1, \"reachability\": \"kReachabilityLarge\", \"airplaneMode\": false, \"batteryData\":{\"wasConnected\": false, \"charged\": false, \"level\": -1, \"connected\": false, \"chargerType\": \"kChargerTypeUnknown\"}, \"restrictedMode\": false, \"batterySaverModeEnabled\": false, \"push_service\":false}"
+        );
     }
 }

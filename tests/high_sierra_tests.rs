@@ -7,17 +7,21 @@
 use std::{fs::File, path::PathBuf};
 
 use macos_unifiedlogs::{
+    cache::MemoryStringCache,
     filesystem::LogarchiveProvider,
-    parser::{build_log, collect_shared_strings, collect_strings, collect_timesync, parse_log},
-    traits::FileProvider,
-    unified_log::UnifiedLogData,
+    parser::{build_log, collect_timesync, parse_log},
+    traits::{FileProvider, SourceFile},
+    unified_log::{EventType, LogType, UnifiedLogData},
 };
 use regex::Regex;
 
-fn collect_logs(provider: &dyn FileProvider) -> Vec<UnifiedLogData> {
+fn collect_logs(provider: &impl FileProvider) -> Vec<UnifiedLogData> {
     provider
         .tracev3_files()
-        .map(|mut file| parse_log(file.reader()).unwrap())
+        .map(|mut file| {
+            let path = file.source_path().to_string();
+            parse_log(file.reader(), &path).unwrap()
+        })
         .collect()
 }
 
@@ -27,8 +31,8 @@ fn test_parse_log_high_sierra() {
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
 
     test_path.push("Persist/0000000000000001.tracev3");
-    let handle = File::open(test_path).unwrap();
-    let log_data = parse_log(handle).unwrap();
+    let handle = File::open(&test_path).unwrap();
+    let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
     assert_eq!(log_data.catalog_data[0].firehose.len(), 172);
     assert_eq!(log_data.catalog_data[0].simpledump.len(), 0);
@@ -41,6 +45,7 @@ fn test_parse_log_high_sierra() {
         30
     );
     assert_eq!(log_data.catalog_data[0].statedump.len(), 0);
+    assert!(log_data.evidence.ends_with("0000000000000001.tracev3"));
 }
 
 #[test]
@@ -49,20 +54,19 @@ fn test_build_log_high_sierra() {
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
 
     let provider = LogarchiveProvider::new(test_path.as_path());
-    let string_results = collect_strings(&provider).unwrap();
-    let shared_strings_results = collect_shared_strings(&provider).unwrap();
+    let cache = MemoryStringCache::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
     test_path.push("Persist/0000000000000001.tracev3");
 
-    let handle = File::open(test_path.as_path()).unwrap();
-    let log_data = parse_log(handle).unwrap();
+    let handle = File::open(&test_path.as_path()).unwrap();
+    let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
     let exclude_missing = false;
     let (results, _) = build_log(
         &log_data,
-        &string_results,
-        &shared_strings_results,
+        &provider,
+        &cache,
         &timesync_data,
         exclude_missing,
     );
@@ -79,8 +83,8 @@ fn test_build_log_high_sierra() {
     assert_eq!(results[0].pid, 59);
     assert_eq!(results[0].thread_id, 622);
     assert_eq!(results[0].category, "default");
-    assert_eq!(results[0].log_type, "Default");
-    assert_eq!(results[0].event_type, "Log");
+    assert_eq!(results[0].log_type, LogType::Default);
+    assert_eq!(results[0].event_type, EventType::Log);
     assert_eq!(results[0].euid, 0);
     assert_eq!(results[0].boot_uuid, "30774817CF1549B0920E1A8E17D47AB5");
     assert_eq!(results[0].timezone_name, "Pacific");
@@ -91,54 +95,68 @@ fn test_build_log_high_sierra() {
         "opendirectoryd (build %{public}s) launched..."
     );
 }
+
 #[test]
 fn test_build_log_complex_format_high_sierra() {
     let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
 
     let provider = LogarchiveProvider::new(test_path.as_path());
-    let string_results = collect_strings(&provider).unwrap();
-    let shared_strings_results = collect_shared_strings(&provider).unwrap();
+    let cache = MemoryStringCache::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
     test_path.push("Persist/0000000000000001.tracev3");
 
-    let handle = File::open(test_path.as_path()).unwrap();
-    let log_data = parse_log(handle).unwrap();
+    let handle = File::open(&test_path.as_path()).unwrap();
+    let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
     let exclude_missing = false;
     let (results, _) = build_log(
         &log_data,
-        &string_results,
-        &shared_strings_results,
+        &provider,
+        &cache,
         &timesync_data,
         exclude_missing,
     );
     assert_eq!(results.len(), 162402);
 
     for result in &results {
-        if result.message == "<PCPersistentTimer: 0x7f8b72c722f0> Calculated minimum fire date [2021-06-19 19:47:59 -0700] (75%) with fire date [2021-06-19 21:51:14 -0700], start date [2021-06-19 13:38:14 -0700], minimum early fire proportion 0.75, power state detection supported: no, in high power state: no, early fire constant interval 0" {
-            assert_eq!(result.process, "/System/Library/PrivateFrameworks/CalendarNotification.framework/Versions/A/XPCServices/CalNCService.xpc/Contents/MacOS/CalNCService");
+        if result.message
+            == "<PCPersistentTimer: 0x7f8b72c722f0> Calculated minimum fire date [2021-06-19 19:47:59 -0700] (75%) with fire date [2021-06-19 21:51:14 -0700], start date [2021-06-19 13:38:14 -0700], minimum early fire proportion 0.75, power state detection supported: no, in high power state: no, early fire constant interval 0"
+        {
+            assert_eq!(
+                result.process,
+                "/System/Library/PrivateFrameworks/CalendarNotification.framework/Versions/A/XPCServices/CalNCService.xpc/Contents/MacOS/CalNCService"
+            );
             assert_eq!(result.subsystem, "com.apple.PersistentConnection");
-            assert_eq!(result.time,1624135094694359040.0);
+            assert_eq!(result.time, 1624135094694359040.0);
             assert_eq!(result.activity_id, 0);
-            assert_eq!(result.library, "/System/Library/PrivateFrameworks/PersistentConnection.framework/Versions/A/PersistentConnection");
+            assert_eq!(
+                result.library,
+                "/System/Library/PrivateFrameworks/PersistentConnection.framework/Versions/A/PersistentConnection"
+            );
             assert_eq!(
                 result.message,
                 "<PCPersistentTimer: 0x7f8b72c722f0> Calculated minimum fire date [2021-06-19 19:47:59 -0700] (75%) with fire date [2021-06-19 21:51:14 -0700], start date [2021-06-19 13:38:14 -0700], minimum early fire proportion 0.75, power state detection supported: no, in high power state: no, early fire constant interval 0"
             );
             assert_eq!(result.pid, 580);
             assert_eq!(result.thread_id, 8759);
-            assert_eq!(result.category, "persistentTimer.com.apple.CalendarNotification.EKTravelEngine.periodicRefreshTimer");
-            assert_eq!(result.log_type, "Default");
-            assert_eq!(result.event_type, "Log");
+            assert_eq!(
+                result.category,
+                "persistentTimer.com.apple.CalendarNotification.EKTravelEngine.periodicRefreshTimer"
+            );
+            assert_eq!(result.log_type, LogType::Default);
+            assert_eq!(result.event_type, EventType::Log);
             assert_eq!(result.euid, 501);
             assert_eq!(result.boot_uuid, "30774817CF1549B0920E1A8E17D47AB5");
             assert_eq!(result.timezone_name, "Pacific");
             assert_eq!(result.process_uuid, "3E78A65047873F8AAFB10EA606B84B5D");
             assert_eq!(result.library_uuid, "761AF71A7FBE3374A4A48A38E0D59B6B");
-            assert_eq!(result.raw_message, "%{public}@ Calculated minimum fire date [%{public}@] (%g%%) with fire date [%{public}@], start date [%{public}@], minimum early fire proportion %g, power state detection supported: %{public}s, in high power state: %{public}s, early fire constant interval %f");
-            return
+            assert_eq!(
+                result.raw_message,
+                "%{public}@ Calculated minimum fire date [%{public}@] (%g%%) with fire date [%{public}@], start date [%{public}@], minimum early fire proportion %g, power state detection supported: %{public}s, in high power state: %{public}s, early fire constant interval %f"
+            );
+            return;
         }
     }
     panic!("Did not find message match")
@@ -150,20 +168,19 @@ fn test_build_log_negative_number_high_sierra() {
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
 
     let provider = LogarchiveProvider::new(test_path.as_path());
-    let string_results = collect_strings(&provider).unwrap();
-    let shared_strings_results = collect_shared_strings(&provider).unwrap();
+    let cache = MemoryStringCache::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
     test_path.push("Special/0000000000000003.tracev3");
-    let handle = File::open(test_path.as_path()).unwrap();
+    let handle = File::open(&test_path.as_path()).unwrap();
 
-    let log_data = parse_log(handle).unwrap();
+    let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
     let exclude_missing = false;
     let (results, _) = build_log(
         &log_data,
-        &string_results,
-        &shared_strings_results,
+        &provider,
+        &cache,
         &timesync_data,
         exclude_missing,
     );
@@ -188,21 +205,14 @@ fn test_parse_all_logs_high_sierra() {
     let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
     let provider = LogarchiveProvider::new(test_path.as_path());
-    let string_results = collect_strings(&provider).unwrap();
-    let shared_strings_results = collect_shared_strings(&provider).unwrap();
+    let cache = MemoryStringCache::default();
     let timesync_data = collect_timesync(&provider).unwrap();
     let log_data = collect_logs(&provider);
     let mut log_data_vec = Vec::new();
 
     let exclude_missing = false;
     for logs in &log_data {
-        let (mut data, _) = build_log(
-            &logs,
-            &string_results,
-            &shared_strings_results,
-            &timesync_data,
-            exclude_missing,
-        );
+        let (mut data, _) = build_log(logs, &provider, &cache, &timesync_data, exclude_missing);
         log_data_vec.append(&mut data);
     }
     assert_eq!(log_data_vec.len(), 569796);
@@ -219,12 +229,16 @@ fn test_parse_all_logs_high_sierra() {
     let message_re = Regex::new(r"^[\s]*%s\s*$").unwrap();
 
     for logs in &log_data_vec {
-        if logs.message == "" {
+        if logs.message.is_empty() {
             empty_counter += 1;
 
-            if logs.process == "/System/Library/PrivateFrameworks/TelephonyUtilities.framework/callservicesd" {
+            if logs.process
+                == "/System/Library/PrivateFrameworks/TelephonyUtilities.framework/callservicesd"
+            {
                 empty_callservicesd += 1;
-            } else if logs.process == "/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/Contents/MacOS/identityservicesd" {
+            } else if logs.process
+                == "/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/Contents/MacOS/identityservicesd"
+            {
                 empty_identityservicesd += 1;
             } else if logs.process == "/usr/libexec/configd" {
                 empty_configd += 1;
@@ -279,13 +293,17 @@ fn test_parse_all_logs_high_sierra() {
         if logs.message.contains("Unsupported Statedump object") {
             statedump_custom_objects += 1;
         }
-        if logs.message.contains("Statedump Protocol Buffer") {
+        if logs.message.contains("Failed to parse StateDump protobuf")
+            || logs
+                .message
+                .contains("Failed to serialize Protobuf HashMap")
+        {
             statedump_protocol_buffer += 1;
         }
     }
     assert_eq!(unknown_strings, 0);
     assert_eq!(invalid_offsets, 3);
     assert_eq!(invalid_shared_string_offsets, 0);
-    assert_eq!(statedump_custom_objects, 2);
-    assert_eq!(statedump_protocol_buffer, 1);
+    assert_eq!(statedump_custom_objects, 0);
+    assert_eq!(statedump_protocol_buffer, 0);
 }

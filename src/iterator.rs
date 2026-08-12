@@ -12,6 +12,7 @@ use nom::bytes::complete::take;
 pub struct UnifiedLogIterator {
     pub data: Vec<u8>,
     pub header: Vec<HeaderChunk>,
+    pub evidence: String,
 }
 
 impl Iterator for UnifiedLogIterator {
@@ -24,6 +25,7 @@ impl Iterator for UnifiedLogIterator {
             header: self.header.clone(),
             catalog_data: Vec::new(),
             oversize: Vec::new(),
+            evidence: self.evidence.clone(),
         };
 
         let mut catalog_data = UnifiedLogCatalogData::default();
@@ -118,16 +120,28 @@ impl Iterator for UnifiedLogIterator {
 
 /// Nom bytes of the log chunk
 fn nom_bytes<'a>(data: &'a [u8], size: &u64) -> nom::IResult<&'a [u8], &'a [u8]> {
-    take(*size)(data)
+    let size = match usize::try_from(*size).ok() {
+        Some(s) => s,
+        None => {
+            error!("[macos-unifiedlogs] u64 is bigger than system usize");
+            return Err(nom::Err::Error(nom::error::Error::new(
+                data,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
+    };
+    take(size)(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::UnifiedLogIterator;
     use crate::{
+        cache::MemoryStringCache,
         filesystem::LogarchiveProvider,
         iterator::nom_bytes,
-        parser::{build_log, collect_shared_strings, collect_strings, collect_timesync},
+        parser::{build_log, collect_timesync},
+        unified_log::{EventType, LogType},
     };
     use std::{fs, path::PathBuf};
 
@@ -142,6 +156,7 @@ mod tests {
         let log_iterator = UnifiedLogIterator {
             data: buffer_results,
             header: Vec::new(),
+            evidence: String::from("0000000000000002.tracev3"),
         };
 
         let mut total = 0;
@@ -171,10 +186,7 @@ mod tests {
         let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         test_path.push("tests/test_data/system_logs_big_sur.logarchive");
 
-        let provider = LogarchiveProvider::new(test_path.as_path());
-
-        let string_results = collect_strings(&provider).unwrap();
-        let shared_strings_results = collect_shared_strings(&provider).unwrap();
+        let mut provider = LogarchiveProvider::new(test_path.as_path());
         let timesync_data = collect_timesync(&provider).unwrap();
 
         test_path.push("Persist/0000000000000002.tracev3");
@@ -183,15 +195,18 @@ mod tests {
         let log_iterator = UnifiedLogIterator {
             data: buffer_results,
             header: Vec::new(),
+            evidence: String::from("0000000000000002.tracev3"),
         };
+
+        let cache = MemoryStringCache::default();
 
         let mut total = 0;
         for chunk in log_iterator {
             let exclude_missing = false;
             let (results, _) = build_log(
                 &chunk,
-                &string_results,
-                &shared_strings_results,
+                &mut provider,
+                &cache,
                 &timesync_data,
                 exclude_missing,
             );
@@ -210,8 +225,8 @@ mod tests {
                 assert_eq!(results[10].pid, 45);
                 assert_eq!(results[10].thread_id, 588);
                 assert_eq!(results[10].category, "device");
-                assert_eq!(results[10].log_type, "Default");
-                assert_eq!(results[10].event_type, "Log");
+                assert_eq!(results[10].log_type, LogType::Default);
+                assert_eq!(results[10].event_type, EventType::Log);
                 assert_eq!(results[10].euid, 0);
                 assert_eq!(results[10].boot_uuid, "80D194AF56A34C54867449D2130D41BB");
                 assert_eq!(results[10].timezone_name, "Pacific");

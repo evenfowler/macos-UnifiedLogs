@@ -5,11 +5,10 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemInfo, FirehosePreamble};
+use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemType, FirehosePreamble};
 use log::{info, warn};
 use nom::bytes::complete::take;
-use nom::number::complete::{le_u16, le_u32, le_u64, le_u8};
-use std::mem::size_of;
+use nom::number::complete::{le_u8, le_u16, le_u32, le_u64};
 
 #[derive(Debug, Clone, Default)]
 pub struct Oversize {
@@ -19,7 +18,7 @@ pub struct Oversize {
     pub first_proc_id: u64,
     pub second_proc_id: u32,
     pub ttl: u8,
-    pub unknown_reserved: Vec<u8>, // 3 bytes
+    pub reserved: Vec<u8>, // 3 bytes
     pub continuous_time: u64,
     pub data_ref_index: u32,
     pub public_data_size: u16,
@@ -32,31 +31,19 @@ impl Oversize {
     pub fn parse_oversize(data: &[u8]) -> nom::IResult<&[u8], Oversize> {
         let mut oversize_results = Oversize::default();
 
-        let (input, chunk_tag) = take(size_of::<u32>())(data)?;
-        let (input, chunk_sub_tag) = take(size_of::<u32>())(input)?;
-        let (input, chunk_data_size) = take(size_of::<u64>())(input)?;
-        let (input, first_number_proc_id) = take(size_of::<u64>())(input)?;
-        let (input, second_number_proc_id) = take(size_of::<u32>())(input)?;
+        let (input, oversize_chunk_tag) = le_u32(data)?;
+        let (input, oversize_chunk_sub_tag) = le_u32(input)?;
+        let (input, oversize_chunk_data_size) = le_u64(input)?;
+        let (input, oversize_first_proc_id) = le_u64(input)?;
+        let (input, oversize_second_proc_id) = le_u32(input)?;
+        let (input, oversize_ttl) = le_u8(input)?;
 
-        let (input, ttl) = take(size_of::<u8>())(input)?;
-        let unknown_reserved_size: u8 = 3;
-        let (input, unknown_reserved) = take(unknown_reserved_size)(input)?;
-        let (input, continuous_time) = take(size_of::<u64>())(input)?;
-        let (input, data_ref_index) = take(size_of::<u32>())(input)?;
-        let (input, public_data_size) = take(size_of::<u16>())(input)?;
-        let (input, private_data_size) = take(size_of::<u16>())(input)?;
-
-        let (_, oversize_chunk_tag) = le_u32(chunk_tag)?;
-        let (_, oversize_chunk_sub_tag) = le_u32(chunk_sub_tag)?;
-        let (_, oversize_chunk_data_size) = le_u64(chunk_data_size)?;
-        let (_, oversize_first_proc_id) = le_u64(first_number_proc_id)?;
-        let (_, oversize_second_proc_id) = le_u32(second_number_proc_id)?;
-
-        let (_, oversize_ttl) = le_u8(ttl)?;
-        let (_, oversize_continous_time) = le_u64(continuous_time)?;
-        let (_, oversize_data_ref_index) = le_u32(data_ref_index)?;
-        let (_, oversize_public_data_size) = le_u16(public_data_size)?;
-        let (_, oversize_private_data_size) = le_u16(private_data_size)?;
+        let reserved_size: u8 = 3;
+        let (input, reserved) = take(reserved_size)(input)?;
+        let (input, oversize_continous_time) = le_u64(input)?;
+        let (input, oversize_data_ref_index) = le_u32(input)?;
+        let (input, oversize_public_data_size) = le_u16(input)?;
+        let (input, oversize_private_data_size) = le_u16(input)?;
 
         oversize_results.chunk_tag = oversize_chunk_tag;
         oversize_results.chunk_subtag = oversize_chunk_sub_tag;
@@ -68,26 +55,27 @@ impl Oversize {
         oversize_results.data_ref_index = oversize_data_ref_index;
         oversize_results.public_data_size = oversize_public_data_size;
         oversize_results.private_data_size = oversize_private_data_size;
-        oversize_results.unknown_reserved = unknown_reserved.to_vec();
+        oversize_results.reserved = reserved.to_vec();
 
         let mut oversize_data_size =
             (oversize_results.public_data_size + oversize_results.private_data_size) as usize;
 
         // Contains item data like firehose (ex: 0x42)
         if oversize_data_size > input.len() {
-            warn!("[macos-unifiedlogs] Oversize data size greater than Oversize remaining string size. Using remaining string size");
+            warn!(
+                "[macos-unifiedlogs] Oversize data size greater than Oversize remaining string size. Using remaining string size"
+            );
             oversize_data_size = input.len();
         }
         let (input, pub_data) = take(oversize_data_size)(input)?;
 
-        let (message_data, _) = take(size_of::<u8>())(pub_data)?;
-        let (message_data, item_count) = take(size_of::<u8>())(message_data)?;
-        let (_, oversize_item_count) = le_u8(item_count)?;
+        let (message_data, _) = le_u8(pub_data)?;
+        let (message_data, oversize_item_count) = le_u8(message_data)?;
 
         let empty_flags = 0;
         // Grab all message items from oversize data
         let (oversize_private_data, mut firehose_item_data) =
-            FirehosePreamble::collect_items(message_data, &oversize_item_count, &empty_flags)?;
+            FirehosePreamble::collect_items(message_data, oversize_item_count, empty_flags)?;
         let (_, _) =
             FirehosePreamble::parse_private_data(oversize_private_data, &mut firehose_item_data)?;
         oversize_results.message_items = firehose_item_data;
@@ -100,28 +88,20 @@ impl Oversize {
         first_proc_id: u64,
         second_proc_id: u32,
         oversize_data: &Vec<Oversize>,
-    ) -> Vec<FirehoseItemInfo> {
-        let mut message_strings: Vec<FirehoseItemInfo> = Vec::new();
-
+    ) -> Vec<FirehoseItemType> {
         for oversize in oversize_data {
             if data_ref == oversize.data_ref_index
                 && first_proc_id == oversize.first_proc_id
                 && second_proc_id == oversize.second_proc_id
             {
-                for message in &oversize.message_items.item_info {
-                    let oversize_firehose = FirehoseItemInfo {
-                        message_strings: message.message_strings.to_owned(),
-                        item_type: message.item_type,
-                        item_size: message.item_size,
-                    };
-                    message_strings.push(oversize_firehose);
-                }
-                return message_strings;
+                return oversize.message_items.item_info.clone();
             }
         }
         // We may not find any oversize data (data may have rolled from logs?)
-        info!("Did not find any oversize log entries from Data Ref ID: {}, First Proc ID: {}, and Second Proc ID: {}", data_ref, first_proc_id, second_proc_id);
-        message_strings
+        info!(
+            "Did not find any oversize log entries from Data Ref ID: {data_ref}, First Proc ID: {first_proc_id}, and Second Proc ID: {second_proc_id}"
+        );
+        Vec::new()
     }
 }
 
@@ -130,7 +110,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemInfo};
+    use crate::chunks::firehose::firehose_log::{FirehoseItemData, FirehoseItemType};
     use crate::chunks::oversize::Oversize;
 
     #[test]
@@ -316,12 +296,15 @@ mod tests {
         assert_eq!(oversize_results.first_proc_id, 192);
         assert_eq!(oversize_results.second_proc_id, 193);
         assert_eq!(oversize_results.ttl, 14);
-        assert_eq!(oversize_results.unknown_reserved, [0, 0, 0]);
+        assert_eq!(oversize_results.reserved, [0, 0, 0]);
         assert_eq!(oversize_results.continuous_time, 12381160463);
         assert_eq!(oversize_results.data_ref_index, 1);
         assert_eq!(oversize_results.public_data_size, 3322);
         assert_eq!(oversize_results.private_data_size, 0);
-        assert_eq!(oversize_results.message_items.item_info[0].message_strings,  "Sandbox: diskarbitrationd(63) System Policy: deny(5) file-read-metadata /Volumes/VMware Shared Folders\nViolation:       System Policy: deny(5) file-read-metadata /Volumes/VMware Shared Folders \nProcess:         diskarbitrationd [63]\nPath:            /usr/libexec/diskarbitrationd\nLoad Address:    0x107b94000\nIdentifier:      diskarbitrationd\nVersion:         ??? (???)\nCode Type:       x86_64 (Native)\nParent Process:  launchd [1]\nResponsible:     /usr/libexec/diskarbitrationd [63]\nUser ID:         0\n\nDate/Time:       2021-08-17 19:58:49.955 EDT\nOS Version:      Mac OS X 10.13.6 (17G66)\nReport Version:  8\n\n\nMetaData: {\"errno\":5,\"profile-flags\":0,\"target\":\"\\/Volumes\\/VMware Shared Folders\",\"process\":\"diskarbitrationd\",\"path\":\"\\/Volumes\\/VMware Shared Folders\",\"primary-filter\":\"path\",\"normalized_target\":[\"Volumes\",\"VMware Shared Folders\"],\"platform-policy\":true,\"summary\":\"deny(5) file-read-metadata \\/Volumes\\/VMware Shared Folders\",\"platform_binary\":\"yes\",\"operation\":\"file-read-metadata\",\"primary-filter-value\":\"\\/Volumes\\/VMware Shared Folders\",\"uid\":0,\"hardware\":\"Mac\",\"flags\":5,\"process-path\":\"\\/usr\\/libexec\\/diskarbitrationd\",\"pid\":63,\"profile\":\"platform\",\"build\":\"Mac OS X 10.13.6 (17G66)\",\"signing-id\":\"com.apple.diskarbitrationd\",\"action\":\"deny\",\"platform-binary\":true}\n\nThread 0 (id: 542):\n0   libsystem_kernel.dylib        \t0x00007fff693bb236 __getattrlist + 10\n1   diskarbitrationd              \t0x0000000107b97d46\n2   diskarbitrationd              \t0x0000000107ba3160\n3   CoreFoundation                \t0x00007fff4143b56b __CFMachPortPerform + 347\n4   CoreFoundation                \t0x00007fff4143b3f9 __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE1_PERFORM_FUNCTION__ + 41\n5   CoreFoundation                \t0x00007fff4143b345 __CFRunLoopDoSource1 + 533\n6   CoreFoundation                \t0x00007fff41432f00 __CFRunLoopRun + 2848\n7   CoreFoundation                \t0x00007fff41432153 CFRunLoopRunSpecific + 483\n8   CoreFoundation                \t0x00007fff41470be3 CFRunLoopRun + 99\n9   diskarbitrationd              \t0x0000000107b9acb6\n10  libdyld.dylib                 \t0x00007fff6926b015 start + 1\n11  diskarbitrationd              \t0x0000000000000001\n\nThread 1 (id: 687):\n0   libsystem_kernel.dylib        \t0x00007fff693bc28a __workq_kernreturn + 10\n1   libsystem_pthread.dylib       \t0x00007fff69582be9 start_wqthread + 13\n\nThread 2 (id: 1541):\n0   libsystem_kernel.dylib        \t0x00007fff693bc28a __workq_kernreturn + 10\n1   libsystem_pthread.dylib       \t0x00007fff69582be9 start_wqthread + 13\n\nBinary Images:\n       0x107b94000 -        0x107babfff  diskarbitrationd (297.70.1) <190ef73f-c204-31bc-bd51-e1be4deaf90a> /usr/libexec/diskarbitrationd\n    0x7fff413ad000 -     0x7fff4184efef  com.apple.CoreFoundation (6.9 - 1454.90) <e5d594bf-9142-3325-a62d-cf4aaf472642> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation\n    0x7fff6926a000 -     0x7fff69287ff7  libdyld.dylib (551.4) <81bf3a82-5719-3b54-aba9-76c82d932cac> /usr/lib/system/libdyld.dylib\n    0x7fff6939f000 -     0x7fff693c5ff7  libsystem_kernel.dylib (4570.71.2) <f22b8d73-69d8-36d7-bf66-7f9ac70c08c2> /usr/lib/system/libsystem_kernel.dylib\n    0x7fff69580000 -     0x7fff6958bfff  libsystem_pthread.dylib (301.50.1) <0e51ccba-91f2-34e1-bf2a-feefd3d321e4> /usr/lib/system/libsystem_pthread.dylib\n\n\n");
+        assert_eq!(
+            oversize_results.message_items.item_info[0].message_strings,
+            "Sandbox: diskarbitrationd(63) System Policy: deny(5) file-read-metadata /Volumes/VMware Shared Folders\nViolation:       System Policy: deny(5) file-read-metadata /Volumes/VMware Shared Folders \nProcess:         diskarbitrationd [63]\nPath:            /usr/libexec/diskarbitrationd\nLoad Address:    0x107b94000\nIdentifier:      diskarbitrationd\nVersion:         ??? (???)\nCode Type:       x86_64 (Native)\nParent Process:  launchd [1]\nResponsible:     /usr/libexec/diskarbitrationd [63]\nUser ID:         0\n\nDate/Time:       2021-08-17 19:58:49.955 EDT\nOS Version:      Mac OS X 10.13.6 (17G66)\nReport Version:  8\n\n\nMetaData: {\"errno\":5,\"profile-flags\":0,\"target\":\"\\/Volumes\\/VMware Shared Folders\",\"process\":\"diskarbitrationd\",\"path\":\"\\/Volumes\\/VMware Shared Folders\",\"primary-filter\":\"path\",\"normalized_target\":[\"Volumes\",\"VMware Shared Folders\"],\"platform-policy\":true,\"summary\":\"deny(5) file-read-metadata \\/Volumes\\/VMware Shared Folders\",\"platform_binary\":\"yes\",\"operation\":\"file-read-metadata\",\"primary-filter-value\":\"\\/Volumes\\/VMware Shared Folders\",\"uid\":0,\"hardware\":\"Mac\",\"flags\":5,\"process-path\":\"\\/usr\\/libexec\\/diskarbitrationd\",\"pid\":63,\"profile\":\"platform\",\"build\":\"Mac OS X 10.13.6 (17G66)\",\"signing-id\":\"com.apple.diskarbitrationd\",\"action\":\"deny\",\"platform-binary\":true}\n\nThread 0 (id: 542):\n0   libsystem_kernel.dylib        \t0x00007fff693bb236 __getattrlist + 10\n1   diskarbitrationd              \t0x0000000107b97d46\n2   diskarbitrationd              \t0x0000000107ba3160\n3   CoreFoundation                \t0x00007fff4143b56b __CFMachPortPerform + 347\n4   CoreFoundation                \t0x00007fff4143b3f9 __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE1_PERFORM_FUNCTION__ + 41\n5   CoreFoundation                \t0x00007fff4143b345 __CFRunLoopDoSource1 + 533\n6   CoreFoundation                \t0x00007fff41432f00 __CFRunLoopRun + 2848\n7   CoreFoundation                \t0x00007fff41432153 CFRunLoopRunSpecific + 483\n8   CoreFoundation                \t0x00007fff41470be3 CFRunLoopRun + 99\n9   diskarbitrationd              \t0x0000000107b9acb6\n10  libdyld.dylib                 \t0x00007fff6926b015 start + 1\n11  diskarbitrationd              \t0x0000000000000001\n\nThread 1 (id: 687):\n0   libsystem_kernel.dylib        \t0x00007fff693bc28a __workq_kernreturn + 10\n1   libsystem_pthread.dylib       \t0x00007fff69582be9 start_wqthread + 13\n\nThread 2 (id: 1541):\n0   libsystem_kernel.dylib        \t0x00007fff693bc28a __workq_kernreturn + 10\n1   libsystem_pthread.dylib       \t0x00007fff69582be9 start_wqthread + 13\n\nBinary Images:\n       0x107b94000 -        0x107babfff  diskarbitrationd (297.70.1) <190ef73f-c204-31bc-bd51-e1be4deaf90a> /usr/libexec/diskarbitrationd\n    0x7fff413ad000 -     0x7fff4184efef  com.apple.CoreFoundation (6.9 - 1454.90) <e5d594bf-9142-3325-a62d-cf4aaf472642> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation\n    0x7fff6926a000 -     0x7fff69287ff7  libdyld.dylib (551.4) <81bf3a82-5719-3b54-aba9-76c82d932cac> /usr/lib/system/libdyld.dylib\n    0x7fff6939f000 -     0x7fff693c5ff7  libsystem_kernel.dylib (4570.71.2) <f22b8d73-69d8-36d7-bf66-7f9ac70c08c2> /usr/lib/system/libsystem_kernel.dylib\n    0x7fff69580000 -     0x7fff6958bfff  libsystem_pthread.dylib (301.50.1) <0e51ccba-91f2-34e1-bf2a-feefd3d321e4> /usr/lib/system/libsystem_pthread.dylib\n\n\n"
+        );
     }
 
     #[test]
@@ -337,7 +320,7 @@ mod tests {
         assert_eq!(oversize_results.first_proc_id, 86);
         assert_eq!(oversize_results.second_proc_id, 302);
         assert_eq!(oversize_results.ttl, 0);
-        assert_eq!(oversize_results.unknown_reserved, [0, 0, 0]);
+        assert_eq!(oversize_results.reserved, [0, 0, 0]);
         assert_eq!(oversize_results.continuous_time, 96693842097);
         assert_eq!(oversize_results.data_ref_index, 1);
         assert_eq!(oversize_results.public_data_size, 8);
@@ -357,24 +340,26 @@ mod tests {
             first_proc_id: 96,
             second_proc_id: 245,
             ttl: 0,
-            unknown_reserved: Vec::new(),
+            reserved: Vec::new(),
             continuous_time: 5609252490,
             data_ref_index: 1,
             public_data_size: 1092,
             private_data_size: 0,
             message_items: FirehoseItemData {
                 item_info: vec![
-                    FirehoseItemInfo {
+                    FirehoseItemType {
                         message_strings: String::from("system kext collection"),
                         item_type: 34,
                         item_size: 0,
+                        ..Default::default()
                     },
-                    FirehoseItemInfo {
+                    FirehoseItemType {
                         message_strings: String::from(
                             "/System/Library/KernelCollections/SystemKernelExtensions.kc",
                         ),
                         item_type: 34,
                         item_size: 0,
+                        ..Default::default()
                     },
                 ],
                 backtrace_strings: Vec::new(),

@@ -5,37 +5,30 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and limitations under the License.
 
-use std::{fs::File, path::PathBuf};
-
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use macos_unifiedlogs::{
-    dsc::SharedCacheStrings,
+    cache::MemoryStringCache,
     filesystem::LogarchiveProvider,
-    parser::{build_log, collect_shared_strings, collect_strings, collect_timesync, parse_log},
+    parser::{build_log, collect_timesync, parse_log},
     timesync::TimesyncBoot,
+    traits::{FileProvider, StringCache},
     unified_log::UnifiedLogData,
-    uuidtext::UUIDText,
 };
+use std::{collections::HashMap, fs::File, path::PathBuf};
 
 fn high_sierra_parse_log(path: &str) {
     let handle = File::open(PathBuf::from(path).as_path()).unwrap();
-    let _ = parse_log(handle).unwrap();
+    let _ = parse_log(handle, path).unwrap();
 }
 
 fn bench_build_log(
     log_data: &UnifiedLogData,
-    string_results: &Vec<UUIDText>,
-    shared_strings_results: &Vec<SharedCacheStrings>,
-    timesync_data: &Vec<TimesyncBoot>,
+    provider: &impl FileProvider,
+    cache: &impl StringCache,
+    timesync_data: &HashMap<String, TimesyncBoot>,
     exclude_missing: bool,
 ) {
-    let (_, _) = build_log(
-        &log_data,
-        &string_results,
-        &shared_strings_results,
-        &timesync_data,
-        exclude_missing,
-    );
+    let (_, _) = build_log(log_data, provider, cache, timesync_data, exclude_missing);
 }
 
 fn high_sierra_single_log_benchpress(c: &mut Criterion) {
@@ -45,7 +38,7 @@ fn high_sierra_single_log_benchpress(c: &mut Criterion) {
     );
 
     c.bench_function("Benching Parsing One High Sierra Log", |b| {
-        b.iter(|| high_sierra_parse_log(&test_path.display().to_string()))
+        b.iter(|| high_sierra_parse_log(&test_path.display().to_string()));
     });
 }
 
@@ -53,26 +46,25 @@ fn high_sierra_build_log_benchbress(c: &mut Criterion) {
     let mut test_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_path.push("tests/test_data/system_logs_high_sierra.logarchive");
     let provider = LogarchiveProvider::new(test_path.as_path());
-    let string_results = collect_strings(&provider).unwrap();
-    let shared_strings_results = collect_shared_strings(&provider).unwrap();
+    let cache = MemoryStringCache::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
     test_path.push("Persist/0000000000000002.tracev3");
     let exclude_missing = false;
     let handle = File::open(test_path.as_path()).unwrap();
 
-    let log_data = parse_log(handle).unwrap();
+    let log_data = parse_log(handle, test_path.to_str().unwrap()).unwrap();
 
     c.bench_function("Benching Building One High Sierra Log", |b| {
         b.iter(|| {
             bench_build_log(
                 &log_data,
-                &string_results,
-                &shared_strings_results,
+                &provider,
+                &cache,
                 &timesync_data,
                 exclude_missing,
-            )
-        })
+            );
+        });
     });
 }
 
