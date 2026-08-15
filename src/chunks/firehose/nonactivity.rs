@@ -23,6 +23,8 @@ pub struct FirehoseNonActivity {
     pub subsystem_value: u16,        // if flag 0x200, has_subsystem
     pub ttl_value: u8,               // if flag 0x0400, has_rules
     pub data_ref_value: u32,         // if flag 0x0800, has_oversize
+    /// Unknown 4 bytes, if flag 0x0040. First seen on macOS 27 (Golden Gate)
+    pub unknown_golden_gate_value: u32,
     pub pc_id: u32, // Appears to be used to calculate string offset for firehose events with Absolute flag
     pub firehose_formatters: FirehoseFormatters,
     pub flags: Vec<MessageFlags>,
@@ -101,6 +103,20 @@ impl FirehoseNonActivity {
             non_activity.data_ref_value = firehose_data_ref;
             non_activity.flags.push(MessageFlags::HasOversize);
 
+            input = firehose_input;
+        }
+
+        // First seen on macOS 27 (Golden Gate). Contents unknown, but the 4 bytes must be consumed
+        // or the firehose item data that follows is misaligned. Only observed on Non-Activity
+        // entries, and never alongside has_rules (0x400) or has_oversize (0x800), so the position
+        // relative to those flags is unverified.
+        let unknown_golden_gate = 0x40;
+        if (firehose_flags & unknown_golden_gate) != 0 {
+            debug!(
+                "[macos-unifiedlogs] Non-Activity Firehose log chunk has unknown Golden Gate flag"
+            );
+            let (firehose_input, unknown_value) = le_u32(input)?;
+            non_activity.unknown_golden_gate_value = unknown_value;
             input = firehose_input;
         }
 

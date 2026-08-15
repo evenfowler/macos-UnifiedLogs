@@ -114,6 +114,7 @@ pub struct SubsystemInfo {
 impl CatalogChunk {
     /// Parse log Catalog data. The log Catalog contains metadata related to log entries such as Process info, Subsystem info, and the compressed log entries
     pub fn parse_catalog(input: &[u8]) -> IResult<&[u8], Self> {
+        let catalog_start_length = input.len();
         let (input, preamble) = LogPreamble::parse(input)?;
         let mut tup = (le_u16, le_u16, le_u16, le_u16, le_u16);
         let (
@@ -163,6 +164,20 @@ impl CatalogChunk {
                 entry,
             );
         }
+        // The Catalog declares where the subchunk array starts, so seek to that offset instead of
+        // assuming it follows the last process info entry. macOS 27 (Golden Gate) appends a 56 byte
+        // trailing record after the process info entries, which would otherwise desync parsing.
+        const CATALOG_UUID_ARRAY_OFFSET: usize = 40;
+        let subchunks_offset = CATALOG_UUID_ARRAY_OFFSET + catalog_offset_sub_chunks as usize;
+        let entries_end_offset = catalog_start_length - input.len();
+
+        let input = if subchunks_offset > entries_end_offset {
+            let (input, _) = take(subchunks_offset - entries_end_offset)(input)?;
+            input
+        } else {
+            input
+        };
+
         let (input, catalog_subchunks) = many_m_n(
             number_sub_chunks as usize,
             number_sub_chunks as usize,
@@ -331,8 +346,12 @@ impl CatalogChunk {
         let (input, (start, end, uncompressed_size, compression_algorithmn, number_index)) =
             tup.parse(input)?;
 
-        const LZ4_COMPRESSION: u32 = 256;
-        if compression_algorithmn != LZ4_COMPRESSION {
+        const LZ4_COMPRESSION: u32 = 0x100;
+        // macOS 27 (Golden Gate) compresses chunkset data with lzbitmap instead of LZ4
+        const LZBITMAP_COMPRESSION: u32 = 0x700;
+        if compression_algorithmn != LZ4_COMPRESSION
+            && compression_algorithmn != LZBITMAP_COMPRESSION
+        {
             return Err(nom::Err::Error(make_error(input, ErrorKind::OneOf)));
         }
 
