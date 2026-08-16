@@ -11,7 +11,7 @@ use super::{
 };
 use crate::util::{decode_standard, extract_string, extract_string_size};
 use byteorder::{BigEndian, WriteBytesExt};
-use log::error;
+use log::{debug, error};
 use nom::{
     IResult, Parser,
     bytes::complete::take,
@@ -562,22 +562,38 @@ pub(crate) fn dns_acceptable(data: &str) -> String {
     String::from("acceptable")
 }
 
-/// Translate DNS getaddrinfo log values
-pub(crate) fn dns_getaddrinfo_opts(data: &str) -> Result<&'static str, DecoderError<'_>> {
-    let message = match data {
-        "0" => "0x0 {}",
-        "8" => "0x8 {use-failover}",
-        "12" => "0xC {in-app-browser, use-failover}",
-        "24" => "0x18 {use-failover, prohibit-encrypted-dns}",
-        _ => {
-            return Err(DecoderError::Parse {
-                input: data.as_bytes(),
-                parser_name: "dns getaddrinfo opts",
-                message: "Unknown DNS getaddrinfo options",
-            });
-        }
+/// Translate DNS getaddrinfo log values.
+///
+/// The value is a bitmask, so decode each bit rather than enumerating whole combinations.
+/// Bits we do not have a name for are rendered as `unknown-0xN` so an unrecognized option
+/// does not fail the decode of the entire log message.
+pub(crate) fn dns_getaddrinfo_opts(data: &str) -> Result<String, DecoderError<'_>> {
+    let Ok(options) = data.parse::<u32>() else {
+        return Err(DecoderError::Parse {
+            input: data.as_bytes(),
+            parser_name: "dns getaddrinfo opts",
+            message: "Could not parse DNS getaddrinfo options as a number",
+        });
     };
-    Ok(message)
+
+    let mut names = Vec::new();
+    for bit_position in 0..u32::BITS {
+        let bit = 1 << bit_position;
+        if options & bit == 0 {
+            continue;
+        }
+        match bit {
+            0x4 => names.push(String::from("in-app-browser")),
+            0x8 => names.push(String::from("use-failover")),
+            0x10 => names.push(String::from("prohibit-encrypted-dns")),
+            _ => {
+                debug!("[macos-unifiedlogs] Unknown DNS getaddrinfo option bit: {bit:#x}");
+                names.push(format!("unknown-{bit:#x}"));
+            }
+        }
+    }
+
+    Ok(format!("{options:#X} {{{}}}", names.join(", ")))
 }
 
 #[cfg(test)]
@@ -829,5 +845,43 @@ mod tests {
 
         let result = dns_getaddrinfo_opts(test_data).unwrap();
         assert_eq!(result, "0x8 {use-failover}");
+    }
+
+    #[test]
+    fn test_dns_getaddrinfo_opts_flag_combinations() {
+        // Values previously enumerated by the decoder
+        assert_eq!(dns_getaddrinfo_opts("0").unwrap(), "0x0 {}");
+        assert_eq!(
+            dns_getaddrinfo_opts("12").unwrap(),
+            "0xC {in-app-browser, use-failover}"
+        );
+        assert_eq!(
+            dns_getaddrinfo_opts("24").unwrap(),
+            "0x18 {use-failover, prohibit-encrypted-dns}"
+        );
+
+        // A single known bit that was never enumerated
+        assert_eq!(dns_getaddrinfo_opts("4").unwrap(), "0x4 {in-app-browser}");
+
+        // A combination of known bits that was never enumerated
+        assert_eq!(
+            dns_getaddrinfo_opts("28").unwrap(),
+            "0x1C {in-app-browser, use-failover, prohibit-encrypted-dns}"
+        );
+    }
+
+    #[test]
+    fn test_dns_getaddrinfo_opts_unknown_bits() {
+        // Seen on macOS 27. Meaning unknown, so the bit is surfaced rather than dropped
+        assert_eq!(dns_getaddrinfo_opts("32").unwrap(), "0x20 {unknown-0x20}");
+        assert_eq!(
+            dns_getaddrinfo_opts("40").unwrap(),
+            "0x28 {use-failover, unknown-0x20}"
+        );
+    }
+
+    #[test]
+    fn test_dns_getaddrinfo_opts_not_a_number() {
+        assert!(dns_getaddrinfo_opts("not-a-number").is_err());
     }
 }
